@@ -37,7 +37,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from github import Github
-from nexus_client import NexusIQClient, NexusAuthError
+from nexus_client import make_vulnerability_source, NexusAuthError
+from scan_report_client import ScanReportError
 from repo_ops import RepoOps
 from code_fixer import CodeFixer, InvalidRetryError
 from pr_client import PRClient
@@ -80,18 +81,23 @@ def _run_fresh_scan():
     """
     logger.info("Mode: FRESH SCAN (scheduler-triggered)")
 
-    nexus_app_id    = os.environ["NEXUS_IQ_APP_PUBLIC_ID"]
+    # Only meaningful against a live Nexus IQ Server (DEPLOYMENT_MODE=azure); the local
+    # ScanReportClient ignores it and reads from SCAN_REPORT_PATH instead.
+    nexus_app_id    = os.environ.get("NEXUS_IQ_APP_PUBLIC_ID", "")
     github_repo     = os.environ["GITHUB_REPO_TARGET"]
     github_repo_url = f"https://github.com/{github_repo}.git"
     github_pat      = os.environ["GITHUB_PAT"]
 
     tracking_store = make_tracking_store()
 
-    nexus = NexusIQClient()
+    vulnerability_source = make_vulnerability_source()
     try:
-        findings = nexus.get_vulnerability_report(nexus_app_id)
+        findings = vulnerability_source.get_vulnerability_report(nexus_app_id)
     except NexusAuthError as exc:
         logger.error("Nexus IQ auth failed: %s", exc)
+        sys.exit(1)
+    except ScanReportError as exc:
+        logger.error("Could not load local scan reports: %s", exc)
         sys.exit(1)
 
     if not findings:

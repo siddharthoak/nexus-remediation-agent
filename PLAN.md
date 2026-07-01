@@ -66,7 +66,8 @@ nexus-remediation-agent/
 │   │   ├── Dockerfile                  ← multi-runtime base: JDK 17 + Maven, Node 20 + npm, Python 3.11
 │   │   ├── instructions.md
 │   │   ├── main.py                     ← two trigger modes; parallel fresh scan + Watcher retry
-│   │   ├── nexus_client.py
+│   │   ├── nexus_client.py             ← NexusIQClient + make_vulnerability_source() factory (see 4.4a)
+│   │   ├── scan_report_client.py       ← ScanReportClient: local-mode Trivy/Grype/OWASP JSON source
 │   │   ├── repo_ops.py
 │   │   ├── code_fixer.py               ← KB-hit path (direct tool apply, no LLM) + tool-use loop fallback
 │   │   │                                  (grep_files, read_file, apply_file_change,
@@ -89,6 +90,7 @@ nexus-remediation-agent/
 │   └── update_agent.py
 ├── tests/
 │   ├── test_nexus_client.py
+│   ├── test_scan_report_client.py   ← Trivy/Grype/OWASP JSON parsing + merge-by-component logic
 │   ├── test_code_fixer.py
 │   ├── test_frameworks.py           ← BuildFramework detection priority + per-framework bump/build/test
 │   └── test_retry_gate.py
@@ -295,6 +297,36 @@ any code changes.
 `COSMOS_ENDPOINT` can override mode detection: if `DEPLOYMENT_MODE` is unset but `COSMOS_ENDPOINT`
 is present, both factories default to the Cosmos backend. Set `DEPLOYMENT_MODE=local` explicitly
 to run InMemory even when `COSMOS_ENDPOINT` is set (useful for isolated unit tests).
+
+### Vulnerability source follows the same `DEPLOYMENT_MODE` switch
+
+**Status: implemented.** `nexus_client.py` defines `make_vulnerability_source()`, following
+the identical pattern as `make_tracking_store()`/`make_knowledge_store()`:
+
+| `DEPLOYMENT_MODE` | Source | When to use |
+| :---- | :---- | :---- |
+| `azure` | `NexusIQClient` | AAF production; also local testing against a real Nexus IQ Server |
+| `local` | `ScanReportClient` | Local development/testing where no Nexus IQ Server is available — reads pre-generated Trivy/Grype/OWASP Dependency-Check JSON reports from `SCAN_REPORT_PATH` instead |
+| _(unset)_ | `NexusIQClient` if `NEXUS_IQ_ENDPOINT` is set, else `ScanReportClient` | Backwards-compatible default |
+
+This exists because `nexus_client.py`'s Nexus IQ REST API contract is unconfirmed (Section 6
+— every endpoint path and response field is marked `# FIXME`) and a live Nexus IQ Server may
+not be available for local testing at all. `agents/fixer/scan_report_client.py` (`ScanReportClient`)
+parses the same GitHub Actions scanner artifacts as `vuln-remediation-agent`'s already-tested
+`ScanReportClient` (ported, not reinvented) and produces the identical `VulnerabilityFinding`
+shape `nexus_client.py` defines — `main.py` calls `make_vulnerability_source().get_vulnerability_report(app_id)`
+without branching on which backend it got. `NEXUS_IQ_APP_PUBLIC_ID` is optional now (`ScanReportClient`
+ignores it — the report path is fixed via `SCAN_REPORT_PATH` instead); it remains required in practice
+for `NexusIQClient`, which still needs it to call the real API.
+
+One caveat surfaced by testing against real Trivy output for `siddharthoak/vulnerable-java-app`:
+Trivy's `FixedVersion` field is sometimes a single comma-joined string of multiple branch-specific
+fix versions (e.g. `"2.9.9.2, 2.8.11.4, 2.7.9.6"` for `jackson-databind`) rather than one clean
+version. `ScanReportClient` passes this through as-is into `recommended_version` (inherited
+behavior from the ported implementation) — `bump_dependency()` would fail to apply a version string
+like that verbatim. This is a known data-quality gap in scanner output, not something this abstraction
+resolves; flagging here rather than silently patching it, since the right fix (pick first version?
+latest by semver? surface for human triage?) is a product decision, not an implementation detail.
 
 ### Cosmos containers
 
@@ -627,6 +659,13 @@ Everything else — orchestration logic, Nexus parsing, retry/guardrail logic, t
 ## 6\. Open Item Before Building `nexus_client.py`
 
 We have not yet confirmed: **which Nexus product and which API endpoint** the customer's existing scans actually use — Nexus IQ Server's policy/report API, or Nexus Repository's component API, or something else already wired up by whoever set up the current scans. `nexus_client.py` is written with `# FIXME` markers on every endpoint path and response field name. This must be resolved by asking the customer or reviewing Sonatype's current API docs before those markers can be replaced with real contract values.
+
+**This no longer blocks local testing.** `make_vulnerability_source()` (Section 4.4a) reads
+`DEPLOYMENT_MODE=local` and swaps in `ScanReportClient`, which needs no Nexus IQ access at
+all — just Trivy/Grype/OWASP JSON reports on disk. The Nexus IQ contract still needs to be
+confirmed before `DEPLOYMENT_MODE=azure` is production-ready, but the rest of the pipeline
+(Classifier, Knowledge Agent, Fixer, Watcher) can be exercised end-to-end against a real
+target repo without waiting on that.
 
 ---
 

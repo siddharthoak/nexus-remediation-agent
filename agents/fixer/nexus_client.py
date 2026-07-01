@@ -214,3 +214,31 @@ class NexusIQClient:
                 if ref.get("type", "") == "CVE":
                     cve_ids.append(ref.get("value", ""))
         return [c for c in cve_ids if c]
+
+
+# ── Factory ───────────────────────────────────────────────────────────────────
+
+def make_vulnerability_source():
+    """
+    Return the appropriate vulnerability source based on DEPLOYMENT_MODE — same
+    switch used by common/tracking_store.py's make_tracking_store() and
+    common/knowledge_store.py's make_knowledge_store().
+
+    DEPLOYMENT_MODE=azure (or NEXUS_IQ_ENDPOINT set without explicit mode) → NexusIQClient
+    DEPLOYMENT_MODE=local (or no NEXUS_IQ_ENDPOINT set)                    → ScanReportClient
+
+    ScanReportClient reads pre-generated Trivy/Grype/OWASP JSON reports from
+    SCAN_REPORT_PATH instead of calling a live Nexus IQ Server — useful for local
+    testing against a repo that doesn't have Nexus IQ access. Both expose the same
+    get_vulnerability_report(app_id) -> list[VulnerabilityFinding] interface, so
+    callers do not need to branch on which one they got.
+    """
+    # Imported lazily to avoid a circular import: scan_report_client.py imports
+    # VulnerabilityFinding from this module at module level.
+    from scan_report_client import ScanReportClient
+
+    mode = os.environ.get("DEPLOYMENT_MODE", "")
+    use_nexus = mode == "azure" or (not mode and bool(os.environ.get("NEXUS_IQ_ENDPOINT")))
+    if use_nexus:
+        return NexusIQClient()
+    return ScanReportClient()

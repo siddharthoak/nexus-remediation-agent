@@ -179,14 +179,47 @@ Both should report all tests passing.
 
 ## 5. (Optional, advanced) Full end-to-end fresh-scan run
 
-This actually calls Nexus IQ, clones from GitHub, calls the Anthropic API, and opens a
-real PR — only do this against a disposable test repo. Requires real credentials, none
-of which are read from `config.yaml` at container runtime (that file is only used by
-`scripts/update_agent.py` to *deploy* the agent) — `main.py` reads these directly from
-the environment:
+This actually clones from GitHub, calls the Anthropic API, and opens a real PR — only do
+this against a disposable test repo. `main.py` reads all of the following directly from
+the environment (none of it comes from `config.yaml`, which is only used by
+`scripts/update_agent.py` to *deploy* the agent).
+
+### 5a. No live Nexus IQ Server? Use `DEPLOYMENT_MODE=local` + pre-generated scan reports
+
+`main.py` calls `make_vulnerability_source()` (`agents/fixer/nexus_client.py`), which reads
+`DEPLOYMENT_MODE` the same way `make_tracking_store()`/`make_knowledge_store()` already do:
+`DEPLOYMENT_MODE=azure` → `NexusIQClient` (real Nexus IQ Server); `DEPLOYMENT_MODE=local` →
+`ScanReportClient`, which parses Trivy/Grype/OWASP Dependency-Check JSON reports from
+`SCAN_REPORT_PATH` instead. This is the only way to run the Fixer against a real repo
+without Nexus IQ access at all.
+
+If you already have Trivy/Grype reports generated for your target repo elsewhere (e.g. from
+a prior run of a different agent, or a GitHub Actions scan artifact), point `SCAN_REPORT_PATH`
+at that directory — no need to regenerate them:
 
 ```bash
 podman run --rm \
+  -v /path/to/existing/scan-reports:/reports:Z \
+  -e DEPLOYMENT_MODE=local \
+  -e SCAN_REPORT_PATH=/reports \
+  -e GITHUB_REPO_TARGET=<org>/<repo> \
+  -e GITHUB_PAT=<your-github-pat> \
+  -e MODEL_DEPLOYMENT_NAME=claude-sonnet-5 \
+  -e ANTHROPIC_API_KEY=<your-anthropic-key> \
+  fixer-agent-local
+```
+
+`SCAN_REPORT_PATH` should contain one or more of `trivy-report.json`, `grype-report.json`, or
+`dependency-check-report/dependency-check-report.json`. `NEXUS_IQ_APP_PUBLIC_ID` isn't needed
+in this mode — `ScanReportClient` ignores it.
+
+### 5b. Have a real Nexus IQ Server? Use `DEPLOYMENT_MODE=azure`
+
+```bash
+podman run --rm \
+  -e DEPLOYMENT_MODE=azure \
+  -e NEXUS_IQ_ENDPOINT=<your-nexus-iq-base-url> \
+  -e NEXUS_IQ_API_KEY=<your-nexus-iq-key> \
   -e NEXUS_IQ_APP_PUBLIC_ID=<your-nexus-app-id> \
   -e GITHUB_REPO_TARGET=<org>/<repo> \
   -e GITHUB_PAT=<your-github-pat> \
@@ -194,6 +227,13 @@ podman run --rm \
   -e ANTHROPIC_API_KEY=<your-anthropic-key> \
   fixer-agent-local
 ```
+
+Note: `nexus_client.py`'s endpoint paths and response field names are marked `# FIXME` —
+they're based on Sonatype's public docs, not yet validated against a real instance (see
+PLAN.md section 6). Expect to need to adjust `_parse_policy_report()` once you see a real
+response shape.
+
+### Either way
 
 With no `COSMOS_ENDPOINT` set, `make_tracking_store()` / `make_knowledge_store()` fall
 back to `InMemoryTrackingStore` / `InMemoryKBStore` automatically — state just won't
