@@ -105,6 +105,7 @@ class PRClient:
         cve_list = (
             ", ".join(change_summary.cve_ids) if change_summary.cve_ids else "see Nexus IQ report"
         )
+        verification_section = self._build_verification_section(change_summary)
 
         return f"""## OSS Vulnerability Remediation
 
@@ -122,13 +123,42 @@ class PRClient:
 ### Rationale
 
 {change_summary.rationale}
-
+{verification_section}
 ---
 
 > This PR was opened automatically by the OSS Remediation Agent.
 > A Watcher agent is monitoring CI and will attempt up to {change_summary.max_retries} fix cycles
 > if CI fails due to the upgrade. If the retry limit is reached, a comment will be added here.
 > Human review is required before merge.
+"""
+
+    def _build_verification_section(self, change_summary) -> str:
+        """
+        Surfaces the detected build framework and in-loop unit test outcome so a human
+        reviewer sees this without digging into the tracking store. Omitted entirely if
+        no framework was detected (degraded mode — CI is the sole verification).
+        """
+        framework = getattr(change_summary, "framework_detected", None)
+        if not framework:
+            return "\n"
+
+        test_status = getattr(change_summary, "unit_test_status", None)
+        status_lines = {
+            "SUCCESS": "All unit tests passed in-loop before this PR was opened.",
+            "NO_TESTS_FOUND": "No unit tests were found for this repository.",
+            "SOFT_FAIL": (
+                "⚠️ Unit tests were still failing after the agent's last fix attempt. "
+                "This PR was opened anyway (soft gate) — the customer CI pipeline and the "
+                "Watcher's retry loop will catch this. Review the failing tests before merge."
+            ),
+        }
+        test_line = status_lines.get(test_status, "Unit test status was not recorded.")
+
+        return f"""
+### Verification
+
+**Build framework:** `{framework}`
+**Unit tests:** {test_line}
 """
 
     def add_comment(self, pr_number: int, comment: str) -> None:

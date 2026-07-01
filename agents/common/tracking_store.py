@@ -25,7 +25,7 @@ Two backends:
 import logging
 import os
 import uuid
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Protocol, runtime_checkable
@@ -73,6 +73,8 @@ class TrackingRecord:
     time_to_resolution_seconds: Optional[float] = None  # Set when CI_PASSED or FAILED_MAX_RETRIES
     token_usage: Optional[dict] = None       # {"prompt_tokens": N, "completion_tokens": N}
     failure_log_excerpt: Optional[str] = None  # Written by Watcher; read by Fixer on retry
+    framework_detected: Optional[str] = None  # e.g. "maven", "gradle", "npm", "python"; set by Fixer at startup
+    unit_test_status: Optional[str] = None   # "SUCCESS" | "NO_TESTS_FOUND" | "SOFT_FAIL"; set at end_turn
 
 
 # ── Protocol ──────────────────────────────────────────────────────────────────

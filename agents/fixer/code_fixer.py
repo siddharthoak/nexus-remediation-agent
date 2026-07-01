@@ -27,19 +27,21 @@ import json
 import logging
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-import xml.etree.ElementTree as ET
 
 import anthropic
 
 from common.tracking_store import TrackingStatus
+from frameworks import detect_framework
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 10  # Guard against runaway agentic loops
+
+BUILD_OUTPUT_CAP = 10_000   # chars; truncated from the end — first errors are most useful
+TEST_OUTPUT_CAP = 20_000    # chars; test failure output can be much larger than compiler output
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -55,6 +57,8 @@ class ChangeSummary:
     max_retries: int = 3
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    framework_detected: Optional[str] = None
+    unit_test_status: Optional[str] = None  # "SUCCESS" | "NO_TESTS_FOUND" | "SOFT_FAIL" | None
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
@@ -80,7 +84,8 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": (
                         "File extensions to include, e.g. [\".java\", \".xml\"]. "
-                        "Defaults to .java, .xml, .properties, .yml, .yaml."
+                        "Defaults to .java, .kt, .groovy, .xml, .properties, .yml, .yaml, "
+                        ".ts, .tsx, .js, .jsx, .json, .py."
                     ),
                 },
             },
@@ -114,8 +119,9 @@ TOOLS = [
             "Apply a single find→replace edit to a file in the cloned repository. "
             "The 'find' string MUST be an exact substring of the file as returned by read_file — "
             "never guess or paraphrase it. "
-            "Changes are written to disk immediately and can be verified with run_maven_compile. "
-            "Do NOT edit pom.xml — the version bump is already applied separately."
+            "Changes are written to disk immediately and can be verified with run_build. "
+            "Do NOT edit the dependency manifest (pom.xml, build.gradle, package.json, "
+            "requirements.txt, pyproject.toml) — the version bump is already applied separately."
         ),
         "input_schema": {
             "type": "object",
@@ -141,13 +147,29 @@ TOOLS = [
         },
     },
     {
-        "name": "run_maven_compile",
+        "name": "run_build",
         "description": (
-            "Compile the repository with 'mvn compile -q'. "
-            "Call this after applying file changes to verify compilation succeeds. "
-            "If it fails, read the compiler error, inspect the affected files with read_file, "
-            "apply corrections with apply_file_change, and compile again. "
-            "No tests are executed — compile only."
+            "Compile/typecheck the repository using its detected build framework "
+            "(Maven, Gradle, npm, or Python). Call this after applying file changes to verify "
+            "the change compiles cleanly. If it fails, read the error, inspect the affected "
+            "files with read_file, apply corrections with apply_file_change, and build again. "
+            "No tests are executed. Always call this before run_unit_tests."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "run_unit_tests",
+        "description": (
+            "Run the unit test suite using the detected build framework, once run_build has "
+            "succeeded. Integration tests are structurally excluded — only unit tests run. "
+            "If tests fail, read the failure output, apply corrections, re-run run_build, "
+            "then run_unit_tests again. This is a soft gate: if tests are still failing when "
+            "you are out of tool rounds, end_turn anyway — the failure will be recorded and "
+            "surfaced in the PR for human review."
         ),
         "input_schema": {
             "type": "object",
@@ -161,8 +183,11 @@ TOOLS = [
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
 FRESH_FIX_PROMPT = """\
-You are a Java/Maven dependency upgrade specialist. Apply the MINIMAL set of code
+You are a software dependency upgrade specialist. Apply the MINIMAL set of code
 changes required to upgrade a specific dependency from one version to another.
+
+## Detected build framework
+{framework_name}
 
 ## Dependency being upgraded
 - Component: {component_name}
@@ -176,7 +201,8 @@ changes required to upgrade a specific dependency from one version to another.
 - `grep_files(pattern, extensions?)` — regex search across file contents.
 - `read_file(relative_path)` — read a file's full content.
 - `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
-- `run_maven_compile()` — run 'mvn compile -q'. No tests. Returns compiler error output on failure.
+- `run_build()` — compile/typecheck using the detected build framework. No tests. Returns build error output on failure.
+- `run_unit_tests()` — run unit tests using the detected build framework. Integration tests are excluded.
 
 ## Your workflow
 1. Call grep_files with the import/package pattern for {component_name}
@@ -186,10 +212,13 @@ changes required to upgrade a specific dependency from one version to another.
    require source-level changes (removed/renamed methods, config format changes).
 4. Call apply_file_change for each required edit.
    The "find" value MUST be an exact substring of the file content from read_file — never guess.
-   Do NOT edit pom.xml — the version bump is already applied.
-5. Call run_maven_compile to verify the changes compile cleanly.
-6. If compilation fails: read the error, inspect the affected files, apply corrections, compile again.
-7. When compilation succeeds (or if no source changes are needed), return end_turn with JSON.
+   Do NOT edit the dependency manifest — the version bump is already applied.
+5. Call run_build to verify the changes compile cleanly.
+6. If the build fails: read the error, inspect the affected files, apply corrections, build again.
+7. Once the build succeeds, call run_unit_tests. If tests fail, read the output, apply
+   corrections, re-run run_build, then run_unit_tests again.
+8. When the build succeeds (or if no source changes are needed), return end_turn with JSON —
+   even if unit tests are still failing after your last attempt.
 
 ## CRITICAL CONSTRAINTS
 - Only apply changes strictly required by the version upgrade.
@@ -204,8 +233,11 @@ changes required to upgrade a specific dependency from one version to another.
 """
 
 RETRY_FIX_PROMPT = """\
-You are a Java/Maven dependency upgrade specialist. A previous fix attempt for this
+You are a software dependency upgrade specialist. A previous fix attempt for this
 dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix.
+
+## Detected build framework
+{framework_name}
 
 ## Dependency being upgraded
 - Component: {component_name}
@@ -224,21 +256,24 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 - `grep_files(pattern, extensions?)` — regex search across file contents.
 - `read_file(relative_path)` — read a file's full content.
 - `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
-- `run_maven_compile()` — run 'mvn compile -q'. No tests. Returns compiler error output on failure.
+- `run_build()` — compile/typecheck using the detected build framework. No tests. Returns build error output on failure.
+- `run_unit_tests()` — run unit tests using the detected build framework. Integration tests are excluded.
 
 ## Your workflow
 1. Analyse the CI failure log to identify the ROOT CAUSE.
 2. Use grep_files and read_file to inspect the files mentioned in the failure log.
 3. Call apply_file_change for the specific, minimal change that fixes the CI failure.
    Do NOT repeat the same change from the previous attempt unless the log shows it was incomplete.
-4. Call run_maven_compile to verify the fix compiles cleanly.
-5. If compilation fails: read the error, inspect affected files, apply corrections, compile again.
-6. When compilation succeeds, return end_turn with JSON.
+4. Call run_build to verify the fix compiles cleanly.
+5. If the build fails: read the error, inspect affected files, apply corrections, build again.
+6. Once the build succeeds, call run_unit_tests to confirm the fix didn't break unit tests.
+7. When the build succeeds, return end_turn with JSON — even if unit tests are still
+   failing after your last attempt.
 
 ## CRITICAL CONSTRAINTS
 - Fix only what the CI failure log tells you is broken.
 - Do NOT refactor, rename, reformat, or improve unrelated code.
-- Do NOT edit pom.xml.
+- Do NOT edit the dependency manifest.
 - Never pass a "find" value you have not verified verbatim in read_file output.
 
 ```json
@@ -250,10 +285,6 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
-
-class PomXMLError(Exception):
-    """Raised when pom.xml cannot be parsed or the target dependency is not found."""
-
 
 class CodeFixerError(Exception):
     """Raised when the model response cannot be parsed into the expected format."""
@@ -287,6 +318,8 @@ class CodeFixer:
         self._client = anthropic.Anthropic()
         self._max_attempts = int(os.environ.get("MAX_RETRY_ATTEMPTS", "3"))
         self._applied_changes: list[str] = []  # paths written by apply_file_change during the loop
+        self._framework = detect_framework(self._repo_path)  # None in degraded mode
+        self._last_test_status: Optional[str] = None  # last run_unit_tests() result this loop
 
     # ── Public entry points ───────────────────────────────────────────────────
 
@@ -324,6 +357,8 @@ class CodeFixer:
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
         }
+        record.framework_detected = summary.framework_detected
+        record.unit_test_status = summary.unit_test_status
         tracking_store.update(record)
         return summary
 
@@ -389,6 +424,8 @@ class CodeFixer:
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
         }
+        record.framework_detected = summary.framework_detected
+        record.unit_test_status = summary.unit_test_status
         tracking_store.update(record)
         return summary
 
@@ -402,12 +439,24 @@ class CodeFixer:
         cve_ids: list,
         failure_log_excerpt: Optional[str],
     ) -> ChangeSummary:
-        # Step 1: Bump pom.xml with an XML parser — never let the model touch pom.xml directly
-        self._bump_pom_version(component_name, current_version, target_version)
+        # Step 1: Bump the dependency manifest via the detected framework — never let the
+        # model touch the manifest directly. In degraded mode (no framework detected),
+        # there is no manifest to bump; Claude proceeds without a compile/test gate.
+        if self._framework is not None:
+            self._framework.bump_dependency(
+                self._repo_path, component_name, current_version, target_version
+            )
+        else:
+            logger.warning(
+                "No supported build framework detected at %s — skipping automatic manifest "
+                "bump and compile/test gates. CI is the fallback verification.",
+                self._repo_path,
+            )
 
-        # Step 2: Run the tool-use loop — Claude inspects files, applies changes, verifies compile.
+        # Step 2: Run the tool-use loop — Claude inspects files, applies changes, verifies build.
         # Changes are written to disk during the loop via apply_file_change tool calls.
         self._applied_changes = []
+        self._last_test_status = None
         file_listing = self._build_file_listing()
         reasoning, prompt_tokens, completion_tokens = self._call_model(
             component_name=component_name,
@@ -418,7 +467,15 @@ class CodeFixer:
         )
 
         # Deduplicate paths while preserving order — a file may have been corrected more than once.
-        files_changed = ["pom.xml"] + list(dict.fromkeys(self._applied_changes))
+        manifest_files = [self._framework.manifest_file] if self._framework else []
+        files_changed = manifest_files + list(dict.fromkeys(self._applied_changes))
+
+        if self._last_test_status in ("SUCCESS", "NO_TESTS_FOUND"):
+            unit_test_status = self._last_test_status
+        elif self._last_test_status is not None:
+            unit_test_status = "SOFT_FAIL"
+        else:
+            unit_test_status = None
 
         return ChangeSummary(
             component_name=component_name,
@@ -429,111 +486,9 @@ class CodeFixer:
             cve_ids=cve_ids,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            framework_detected=self._framework.name if self._framework else None,
+            unit_test_status=unit_test_status,
         )
-
-    # ── pom.xml manipulation ──────────────────────────────────────────────────
-
-    def _bump_pom_version(self, component_name: str, current_version: str, target_version: str) -> None:
-        """
-        Bump a dependency version in pom.xml using an XML parser (never string-replace).
-
-        Handles three real-world patterns found in customer repos:
-          1. Standard literal <version>X.Y.Z</version>
-          2. Maven property reference <version>${spring.version}</version> — updates the
-             property in <properties>, or inlines the version if the property is not found.
-          3. BOM-managed dependency (no <version> element) — adds an explicit <version>
-             override so the new version is pinned regardless of the BOM.
-
-        Supports both namespaced pom.xml files (xmlns="http://maven.apache.org/POM/4.0.0")
-        and bare files without a namespace declaration (some legacy / generated poms).
-        """
-        pom_path = self._repo_path / "pom.xml"
-        if not pom_path.exists():
-            raise PomXMLError(f"pom.xml not found at {pom_path}")
-
-        tree = ET.parse(str(pom_path))
-        root = tree.getroot()
-
-        ns_uri = "http://maven.apache.org/POM/4.0.0"
-        ET.register_namespace("", ns_uri)
-
-        if root.tag.startswith(f"{{{ns_uri}}}"):
-            ns      = {"m": ns_uri}
-            dep_xpath  = ".//m:dependency"
-            tag        = lambda t: f"m:{t}"        # noqa: E731
-            subtag     = lambda t: f"{{{ns_uri}}}{t}"  # noqa: E731
-            prop_xpath = lambda name: f"./m:properties/m:{name}"  # noqa: E731
-        else:
-            ns      = {}
-            dep_xpath  = ".//dependency"
-            tag        = lambda t: t               # noqa: E731
-            subtag     = lambda t: t               # noqa: E731
-            prop_xpath = lambda name: f"./properties/{name}"  # noqa: E731
-
-        parts       = component_name.split(":")
-        artifact_id = parts[-1]
-        group_id    = parts[0] if len(parts) > 1 else None
-
-        found = False
-        for dep in root.findall(dep_xpath, ns):
-            aid_el = dep.find(tag("artifactId"), ns)
-            gid_el = dep.find(tag("groupId"),    ns)
-            ver_el = dep.find(tag("version"),     ns)
-
-            if aid_el is None:
-                continue
-
-            aid_match = aid_el.text == artifact_id
-            gid_match = group_id is None or (gid_el is not None and gid_el.text == group_id)
-            if not (aid_match and gid_match):
-                continue
-
-            if ver_el is None:
-                # BOM-managed — add an explicit version override.
-                ET.SubElement(dep, subtag("version")).text = target_version
-                found = True
-                logger.info(
-                    "pom.xml: %s added explicit version %s (was BOM-managed)",
-                    component_name, target_version,
-                )
-                break
-
-            ver_text = ver_el.text or ""
-
-            if ver_text.startswith("${") and ver_text.endswith("}"):
-                # Maven property reference — update the property value in <properties>.
-                prop_name = ver_text[2:-1]
-                prop_el = root.find(prop_xpath(prop_name), ns)
-                if prop_el is not None:
-                    logger.info(
-                        "pom.xml: property %s %s → %s",
-                        prop_name, prop_el.text, target_version,
-                    )
-                    prop_el.text = target_version
-                else:
-                    # Property not found — inline the version directly.
-                    logger.info(
-                        "pom.xml: %s inlining version (property %s not found)",
-                        component_name, prop_name,
-                    )
-                    ver_el.text = target_version
-                found = True
-                break
-
-            if ver_text == current_version:
-                ver_el.text = target_version
-                found = True
-                logger.info(
-                    "pom.xml: %s %s → %s", component_name, current_version, target_version,
-                )
-                break
-
-        if not found:
-            raise PomXMLError(
-                f"Dependency {component_name}@{current_version} not found in pom.xml."
-            )
-
-        tree.write(str(pom_path), xml_declaration=True, encoding="utf-8")
 
     # ── Model call (agentic tool-use loop) ────────────────────────────────────
 
@@ -553,8 +508,13 @@ class CodeFixer:
         Token counts are accumulated across all rounds so the tracking record
         reflects the true cost of the entire conversation, not just the last turn.
         """
+        framework_name = self._framework.name if self._framework else (
+            "none detected — no compile/test gate available; CI is the fallback verification"
+        )
+
         if failure_log_excerpt:
             prompt = RETRY_FIX_PROMPT.format(
+                framework_name=framework_name,
                 component_name=component_name,
                 current_version=current_version,
                 target_version=target_version,
@@ -563,6 +523,7 @@ class CodeFixer:
             )
         else:
             prompt = FRESH_FIX_PROMPT.format(
+                framework_name=framework_name,
                 component_name=component_name,
                 current_version=current_version,
                 target_version=target_version,
@@ -639,8 +600,10 @@ class CodeFixer:
                 inputs.get("find", ""),
                 inputs.get("replace", ""),
             )
-        if name == "run_maven_compile":
-            return self._tool_run_maven_compile()
+        if name == "run_build":
+            return self._tool_run_build()
+        if name == "run_unit_tests":
+            return self._tool_run_unit_tests()
         return f"Unknown tool: {name!r}"
 
     def _tool_read_file(self, relative_path: str) -> str:
@@ -660,15 +623,19 @@ class CodeFixer:
     def _tool_grep_files(self, pattern: str, extensions: list) -> str:
         if not pattern:
             return "ERROR: pattern is required."
-        exts = set(extensions) if extensions else {".java", ".xml", ".properties", ".yml", ".yaml"}
+        exts = set(extensions) if extensions else {
+            ".java", ".kt", ".groovy", ".xml", ".properties", ".yml", ".yaml",
+            ".ts", ".tsx", ".js", ".jsx", ".json", ".py",
+        }
         try:
             compiled = re.compile(pattern)
         except re.error as exc:
             return f"ERROR: invalid regex {pattern!r}: {exc}"
 
+        excluded_dirs = {"target", "build", "node_modules", ".venv", "venv", ".git"}
         results = []
         for f in sorted(self._repo_path.rglob("*")):
-            if "target" in f.parts or f.suffix not in exts:
+            if excluded_dirs & set(f.parts) or f.suffix not in exts:
                 continue
             try:
                 lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -712,42 +679,55 @@ class CodeFixer:
         logger.info("apply_file_change: modified %s", relative_path)
         return f"OK: change applied to {relative_path}"
 
-    def _tool_run_maven_compile(self) -> str:
+    def _tool_run_build(self) -> str:
         """
-        Tool handler: run 'mvn compile -q' in the cloned repo.
-        Returns a success message or the full compiler error for Claude to diagnose.
-        No tests are executed.
+        Tool handler: delegate to the detected framework's build() (compile/typecheck only).
+        Returns a success message or the build output (capped) for Claude to diagnose.
+        Degrades to an ERROR string if no framework was detected — Claude proceeds to
+        end_turn without a compile gate; CI is the fallback.
         """
-        try:
-            result = subprocess.run(
-                ["mvn", "compile", "-q", "--batch-mode"],
-                cwd=str(self._repo_path),
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except FileNotFoundError:
-            return "ERROR: mvn not found — Maven must be installed in the container image."
-        except subprocess.TimeoutExpired:
-            return "ERROR: mvn compile timed out after 300 seconds."
+        if self._framework is None:
+            return "ERROR: no supported build file found"
 
-        if result.returncode == 0:
-            return "mvn compile: SUCCESS — no compilation errors."
-
-        output = (
-            f"mvn compile: FAILED (exit code {result.returncode})\n\n"
-            f"STDERR:\n{result.stderr[:10_000]}"
+        result = self._framework.build(self._repo_path)
+        if result.success:
+            return f"build ({self._framework.name}): SUCCESS — no compilation errors."
+        return (
+            f"build ({self._framework.name}): FAILED\n\n"
+            f"{result.output[:BUILD_OUTPUT_CAP]}"
         )
-        if result.stdout.strip():
-            output += f"\n\nSTDOUT:\n{result.stdout[:5_000]}"
-        return output
+
+    def _tool_run_unit_tests(self) -> str:
+        """
+        Tool handler: delegate to the detected framework's test_unit() (unit tests only,
+        integration tests structurally excluded). Records the outcome in
+        self._last_test_status so _execute_fix can populate ChangeSummary.unit_test_status
+        after the loop ends. This is a soft gate — Claude may end_turn even on failure.
+        """
+        if self._framework is None:
+            return "ERROR: no supported build file found"
+
+        result = self._framework.test_unit(self._repo_path)
+        self._last_test_status = result.status
+
+        if result.status == "SUCCESS":
+            return f"tests ({self._framework.name}): SUCCESS — all unit tests passed."
+        if result.status == "NO_TESTS_FOUND":
+            return f"tests ({self._framework.name}): NO_TESTS_FOUND — treat as success."
+        return (
+            f"tests ({self._framework.name}): {result.status}\n\n"
+            f"{result.output[:TEST_OUTPUT_CAP]}"
+        )
 
     # ── File listing (orientation only — content is read via tools) ───────────
 
     def _build_file_listing(self) -> str:
         files = []
-        for ext in ("*.java", "*.xml", "*.properties", "*.yml", "*.yaml"):
+        for ext in (
+            "*.java", "*.kt", "*.groovy", "*.xml", "*.properties", "*.yml", "*.yaml",
+            "*.ts", "*.tsx", "*.js", "*.jsx", "*.json", "*.py",
+        ):
             for f in self._repo_path.rglob(ext):
-                if "target" not in f.parts:
+                if not ({"target", "build", "node_modules", ".venv", "venv", ".git"} & set(f.parts)):
                     files.append(str(f.relative_to(self._repo_path)))
         return "\n".join(sorted(files)[:200])

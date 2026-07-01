@@ -6,7 +6,7 @@
 
 Premier's repositories accumulate Open Source Software (OSS) vulnerability backlogs faster than developers can address them. We want an automated pipeline that:
 
-1. Fetches vulnerability scan results for a Java repository from Nexus.  
+1. Fetches vulnerability scan results for a repository from Nexus. The initial target was Java/Maven; the Fixer's build framework abstraction (Section 4.7) now also supports Gradle, npm (Node/React/Angular), and Python repos, plus polyglot repos with a Java backend and a JS frontend.  
 2. Uses an AI agent to fix the vulnerable dependencies and any resulting code breakage (deprecated APIs, signature changes, etc.).  
 3. Opens a Pull Request with the fix, which triggers the customer's existing CI pipeline (unit \+ integration tests).  
 4. Uses a second agent to watch that PR. If CI fails, it inspects the logs and invokes the Fixer agent with the failure context — repeating up to a bounded limit — so the change is iteratively verified before it's left for human review.
@@ -90,6 +90,7 @@ nexus-remediation-agent/
 ├── tests/
 │   ├── test_nexus_client.py
 │   ├── test_code_fixer.py
+│   ├── test_frameworks.py           ← BuildFramework detection priority + per-framework bump/build/test
 │   └── test_retry_gate.py
 └── .github/workflows/
     └── ci.yml
@@ -426,7 +427,7 @@ This is structurally different from Claude Code CLI (where Claude asks your loca
 
 **Before** (no local verification): A version upgrade from e.g. `okhttp 3.x` to `4.x` changes method signatures. Claude would apply the change, the loop would end, and CI would fail with a compilation error. The Watcher would need to trigger a retry, consuming another Claude API call and another CI run just to catch what `mvn compile` would have flagged in seconds.
 
-**After** (`run_maven_compile` before `end_turn`): Claude calls `run_maven_compile` after applying changes. On SUCCESS it calls `end_turn`. On FAILURE it receives the compiler STDERR, reads the affected files with `read_file`, applies corrections with `apply_file_change`, and compiles again — all within the same loop. The PR is only opened after `mvn compile -q` passes. This eliminates CI round-trips for the most common class of post-upgrade failures (deprecated API calls, renamed classes, changed method signatures) without running the test suite.
+**After** (`run_build` before `end_turn`): Claude calls `run_build` after applying changes, which dispatches to the detected framework's compile/typecheck command (`mvn compile`, `./gradlew classes`, `npm run build`/`npx tsc --noEmit`, or `python -m compileall`). On SUCCESS it calls `end_turn`. On FAILURE it receives the build tool's STDERR, reads the affected files with `read_file`, applies corrections with `apply_file_change`, and builds again — all within the same loop. The PR is only opened after `run_build` passes. This eliminates CI round-trips for the most common class of post-upgrade failures (deprecated API calls, renamed classes, changed method signatures) without running the test suite.
 
 ### 4\. Clone-once \+ parallel workers eliminates the sequential per-finding bottleneck
 
@@ -453,12 +454,19 @@ No human action is required or expected at any earlier point. A human step befor
 
 ## 4.7. Framework Abstraction — Supported Tech Stacks
 
+**Status: implemented.** `agents/fixer/frameworks/` exists with `maven.py`, `gradle.py`, `npm.py`, `python_pip.py`; `code_fixer.py` calls `detect_framework()` in `CodeFixer.__init__` and drives `bump_dependency()` / `run_build` / `run_unit_tests` through the returned instance. Covered by `tests/test_frameworks.py` (detection priority, bump correctness per framework, degraded-mode graceful handling) and the framework-detection tests in `tests/test_code_fixer.py`.
+
 ### `BuildFramework` interface
 
 `agents/fixer/frameworks/__init__.py` declares a `BuildFramework` abstract base class with four methods. All framework implementations must satisfy this interface:
 
 ```python
 class BuildFramework(ABC):
+    name: str                                       # "maven" | "gradle" | "npm" | "python"
+
+    def __init__(self):
+        self.manifest_file: str = ""                # set by bump_dependency(), read after
+
     @classmethod
     def detect(cls, repo_path: Path) -> bool: ...   # True if this framework owns this repo
     def bump_dependency(self, repo_path, component, old_ver, new_ver) -> None: ...
@@ -466,7 +474,9 @@ class BuildFramework(ABC):
     def test_unit(self, repo_path) -> TestResult: ...    # unit tests only; ITs excluded
 ```
 
-`detect_framework(repo_path)` tries each implementation in priority order and returns the first match. Priority order matters for polyglot repos (e.g. a Java project with a `package.json` for frontend tooling should resolve as Maven, not npm):
+`manifest_file` is not a static per-framework constant — it is set as a side effect of `bump_dependency()`, because which file actually got edited can vary at runtime (Gradle in particular may bump `build.gradle`, `build.gradle.kts`, or `gradle/libs.versions.toml` depending on where the dependency is declared; see the Gradle row below). `code_fixer.py` reads `framework.manifest_file` after the bump call to build `ChangeSummary.files_changed`.
+
+`detect_framework(repo_path)` tries each implementation in priority order and returns the first match, or `None` if no supported build file is found. Priority order matters for polyglot repos (e.g. a Java project with a `package.json` for frontend tooling should resolve as Maven, not npm):
 
 ```
 1. pom.xml present            → Maven
@@ -475,29 +485,41 @@ class BuildFramework(ABC):
 4. requirements.txt / pyproject.toml / setup.py → Python
 ```
 
-If no framework is detected, `run_build` returns `"ERROR: no supported build file found"` and Claude proceeds to `end_turn` without a compile gate (degraded mode — CI is the fallback).
+If no framework is detected, `CodeFixer._framework` is `None`: the manifest bump is skipped (nothing to bump), `run_build`/`run_unit_tests` both return `"ERROR: no supported build file found"`, and Claude proceeds to `end_turn` without a compile gate (degraded mode — CI is the fallback). `ChangeSummary.framework_detected` is `None` in this case and the PR body's Verification section is omitted entirely rather than showing an empty state.
 
 ### Per-framework implementation
 
-| Framework | `bump_dependency` | `build` command | `test_unit` command | IT exclusion mechanism |
-| :---- | :---- | :---- | :---- | :---- |
-| **Maven** | XML parser (`xml.etree`) on `pom.xml` | `mvn compile -q --batch-mode` (300 s) | `mvn test -q --batch-mode -Dexclude="**/*IT.java,**/*IntegrationTest.java"` (600 s) | Surefire plugin runs UTs; Failsafe plugin runs ITs — invoking `mvn test` (not `verify`) never triggers Failsafe |
-| **Gradle** | Regex on `build.gradle` / TOML parse for `libs.versions.toml` | `./gradlew classes -q` (300 s) | `./gradlew test -q` (600 s) | By convention, Gradle's `test` task runs unit tests; integration test tasks are named separately (`integrationTest`, `itest`) |
-| **npm** | `json.loads` / `json.dumps` on `package.json` | `npm run build --if-present` (300 s); falls back to `npx tsc --noEmit` if no build script | `CI=true npm test -- --testPathIgnorePatterns=integration --watchAll=false` (600 s) | `CI=true` prevents interactive watch mode; `--testPathIgnorePatterns` excludes paths matching `integration` |
-| **Python** | `re.sub` on `requirements.txt`; TOML parse for `pyproject.toml` | `python -m compileall . -q` (60 s) | `pytest -q -m "not integration" --ignore=tests/integration` (600 s) | `pytest -m` respects `@pytest.mark.integration` markers; `--ignore` excludes the conventional integration test directory |
+| Framework | `bump_dependency` | `build` command | `test_unit` command | IT exclusion mechanism | `NO_TESTS_FOUND` detection |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| **Maven** | XML parser (`xml.etree`) on `pom.xml` | `mvn compile -q --batch-mode` (300 s) | `mvn test -q --batch-mode -Dexclude="**/*IT.java,**/*IntegrationTest.java"` (600 s) | Surefire plugin runs UTs; Failsafe plugin runs ITs — invoking `mvn test` (not `verify`) never triggers Failsafe | `src/test/java` scanned for `*Test.java`/`*Tests.java` files (excluding `*IT.java`/`*IntegrationTest.java`) before invoking `mvn test` at all — Maven's own exit code can't distinguish "0 tests ran" from "all tests passed" |
+| **Gradle** | Regex on `build.gradle`/`.kts` for an inline `'group:artifact:version'` literal; falls back to `gradle/libs.versions.toml` **only if the old version string is unambiguous there** (raises `BuildGradleError` rather than guessing if it appears more than once) | `./gradlew classes -q` (300 s) | `./gradlew test -q` (600 s) | By convention, Gradle's `test` task runs unit tests; integration test tasks are named separately (`integrationTest`, `itest`) | `src/test/{java,kotlin,groovy}` scanned for `*Test.*`/`*Tests.*` files before invoking `./gradlew test` |
+| **npm** | `json.loads`/`json.dumps` on `package.json`, across `dependencies`/`devDependencies`/`peerDependencies`/`optionalDependencies`; preserves the existing semver range prefix (`^`, `~`, etc.) | `npm ci --no-audit --no-fund`, then `npm run build --if-present`; if there's no `build` script **and no `tsconfig.json`**, skipped entirely as a no-op success (avoids an unnecessary `npx tsc` package download); otherwise falls back to `npx tsc --noEmit` | `CI=true npm test -- --testPathIgnorePatterns=integration --watchAll=false` (600 s) | `CI=true` prevents interactive watch mode; `--testPathIgnorePatterns` excludes paths matching `integration` | `package.json`'s `scripts.test` key absent → `NO_TESTS_FOUND` without invoking `npm test` |
+| **Python** | `re.sub` on `requirements.txt` (PEP 503 name normalization: `-`/`_`/`.` and case are equivalent); for `pyproject.toml`, `tomllib` (stdlib, read-only) locates the exact dependency string, then a targeted string-replace applies the edit so comments/formatting are preserved — `tomllib` has no writer, so a full round-trip isn't possible | `python -m compileall . -q -x` (excludes `.venv`, `venv`, `node_modules`, `.git`, `build`, `dist`) (60 s) | `pytest -q -m "not integration" --ignore=tests/integration` (600 s) | `pytest -m` respects `@pytest.mark.integration` markers; `--ignore` excludes the conventional integration test directory | pytest exit code `5` ("no tests collected") maps directly to `NO_TESTS_FOUND` |
+
+Build output is capped at 10 000 chars and test output at 20 000 chars before being returned to Claude as a tool result (see `BUILD_OUTPUT_CAP`/`TEST_OUTPUT_CAP` in `code_fixer.py`) — this cap is applied centrally in the tool dispatch layer, not duplicated per framework module.
 
 ### Docker strategy
 
-All four runtimes are installed in a single Fixer Docker image. This makes the image larger (~1.5 GB) but avoids per-framework container definitions and keeps the framework detection fully runtime-driven:
+All four runtimes are installed in a single Fixer Docker image (`agents/fixer/Dockerfile`), built on `python:3.11-slim-bookworm` rather than a fresh `ubuntu:22.04` base (the existing image was already Debian-based; extending it avoids introducing a second base-image lineage for one component). The Debian release is **pinned explicitly to `bookworm`**: the rolling `python:3.11-slim` tag was found (via an actual `docker build`) to have moved to Debian trixie, which only ships `openjdk-21`/`openjdk-25` — not `openjdk-17`. Pinning to bookworm keeps `openjdk-17-jdk-headless` available and prevents this from silently breaking the next time the upstream base image rolls forward.
 
 ```dockerfile
-FROM ubuntu:22.04
-RUN apt-get install -y openjdk-17-jdk maven nodejs npm python3.11 python3-pip
+FROM python:3.11-slim-bookworm
+RUN apt-get install -y --no-install-recommends \
+        git curl ca-certificates gnupg openjdk-17-jdk-headless maven \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs
+RUN java -version && mvn --version && node --version && npm --version && python3 --version
 ```
 
-Gradle does not require a global install — projects include a `gradlew` wrapper; the Fixer calls `./gradlew` relative to the repo root. If `gradlew` is absent, `build()` returns an error and degrades gracefully.
+The final `RUN` line is the build-time smoke test called for in Section 3's `update_agent.py` description — implemented directly as a Dockerfile `RUN` step instead of a separate check in `update_agent.py`, since a failing version check already fails `docker build` itself (the same "fail at build time, not runtime" property, with one less place to keep in sync). Verified locally: `docker build -f agents/fixer/Dockerfile .` succeeds and `java -version`/`mvn --version`/`node --version`/`npm --version` all resolve inside the built image (JDK 17.0.19, Maven 3.8.7, Node 20.20.2, Python 3.11.15).
+
+Gradle does not require a global install — projects include a `gradlew` wrapper; the Fixer calls `./gradlew` relative to the repo root. If `gradlew` is absent, `build()` and `test_unit()` both return an ERROR result and degrade gracefully rather than raising.
 
 For production, framework-specific images reduce attack surface and image size. This is a post-POC concern.
+
+### PR body — Verification section
+
+`pr_client.py`'s `_build_pr_body()` now includes a "Verification" section (via `_build_verification_section()`) showing the detected framework and the in-loop unit test outcome, so a human reviewer sees this without opening the tracking store. Omitted entirely when no framework was detected (degraded mode).
 
 ---
 
@@ -530,14 +552,14 @@ The soft gate captures the value (Claude self-corrects on genuine test failures 
 
 ### Design choices
 
-**`_bump_pom_version` handles three real-world pom.xml patterns.** The XML parser-based bump handles
+**`MavenFramework.bump_dependency` handles three real-world pom.xml patterns.** The XML parser-based bump handles
 cases beyond a simple `<version>X.Y.Z</version>` literal:
 
 1. **Maven property references** — `<version>${spring.version}</version>` is common in Spring-family projects. The implementation resolves the property name and updates it in `<properties>`, falling back to inlining the version directly if the property element is not found.
 2. **BOM-managed dependencies** — dependencies managed by a BOM import often have no `<version>` element. The implementation adds an explicit `<version>` override so the bump is applied regardless of what the BOM specifies.
 3. **Bare pom.xml files** — some legacy or generated pom.xml files omit the Maven namespace (`xmlns="http://maven.apache.org/POM/4.0.0"`). The implementation detects whether the namespace is present and adapts XPath queries accordingly. Without this, namespace-prefixed queries silently return no matches against bare files.
 
-All three cases raise `PomXMLError` with a specific message if the dependency is genuinely absent, which Claude receives as a tool result and diagnoses.
+All three cases raise `PomXMLError` (a `DependencyBumpError` subclass — every framework module defines its own: `PackageJsonError`, `RequirementsError`, `BuildGradleError`) with a specific message if the dependency is genuinely absent. This happens before the model call, so it surfaces as a Python exception in the Fixer's own logs/tracking record rather than a tool result Claude has to diagnose — an invalid bump target means the finding data itself is wrong, not something a code change can fix.
 
 **`run_build` before `run_unit_tests`, never both at once.** Claude always runs `run_build` first. If it fails, Claude self-corrects before calling `run_unit_tests`. Running tests against code that doesn't compile wastes the test timeout (up to 600 s) and produces noise output. The two tools are always called in sequence within the loop.
 
@@ -661,7 +683,7 @@ This is an internal team visibility tool for the POC, not a Premier-facing produ
 1. Confirm the Nexus IQ/Repository API question (Section 6\) and replace `# FIXME` markers in `nexus_client.py` with the real endpoint paths and response field names.  
 2. Push the repo to GitHub so the AAF-access person can clone it.  
 3. Hand the AAF-access person the README "Setup" section (Section 5, items 1–5).  
-4. Run the manual smoke test together (Section 5, item 6\) — specifically verify the compile gate fires correctly by observing `run_maven_compile: SUCCESS` in the Fixer container logs before PR creation.  
+4. Run the manual smoke test together (Section 5, item 6\) — specifically verify the compile gate fires correctly by observing `build (maven): SUCCESS` (or the equivalent for whichever framework the target repo uses) in the Fixer container logs before PR creation.  
 5. Iterate based on what the smoke test surfaces, particularly around `AafFixerInvoker` SDK parameter names (Section 5, last row).
 6. **Build `agents/discovery/` (post-POC hardening)** — implement once the customer provides their first `ignore_list.yaml` / `known_list.yaml`. Prerequisite: add `IGNORED` and `KNOWN_BLOCKED` status writes to `tracking_store.py` and create `config/` YAML files. The Fixer's `_run_fresh_scan()` will then pass the Nexus findings through `ListFilter` before handing them to the Knowledge Agent, eliminating KB tokens spent on accepted-risk findings.
 
@@ -675,7 +697,7 @@ This is an internal team visibility tool for the POC, not a Premier-facing produ
 
 **Resolution:** We will build a two-tier knowledge base, persisted in Azure Cosmos DB (`kb-entries` container) so entries survive container restarts and are shared across all agent instances. The KB is accessed via `make_knowledge_store()` which returns `CosmosKBStore` in Azure mode and `InMemoryKBStore` (preloaded with Tier 2 playbooks) in local mode.
 
-**Tier 1 — Learned patterns (agent-written).** After a fix is confirmed by CI, the Watcher writes a KB entry containing: what files changed, the exact `find`/`replace` pairs applied per file, the model's rationale, and the token cost. On the next run where the same `(component, old_version, new_version)` tuple appears — in this repo or any other — the Fixer retrieves the stored patterns and applies them directly using `apply_file_change` and `run_maven_compile` without any LLM call. Only if direct pattern application fails (compile error, find-string mismatch against the new repo's actual content) does the agent fall back to a Claude API call with the KB entry injected as context. This eliminates the discovery phase entirely for known version pairs and reduces token cost to near-zero on repeat encounters.
+**Tier 1 — Learned patterns (agent-written).** After a fix is confirmed by CI, the Watcher writes a KB entry containing: what files changed, the exact `find`/`replace` pairs applied per file, the model's rationale, and the token cost. On the next run where the same `(component, old_version, new_version)` tuple appears — in this repo or any other — the Fixer retrieves the stored patterns and applies them directly using `apply_file_change` and `run_build` without any LLM call. Only if direct pattern application fails (build error, find-string mismatch against the new repo's actual content) does the agent fall back to a Claude API call with the KB entry injected as context. This eliminates the discovery phase entirely for known version pairs and reduces token cost to near-zero on repeat encounters.
 
 When a fix exhausts its retry limit without succeeding, the KB records a negative entry for that version pair. This prevents the agent from blindly re-attempting the same failing upgrade on the next scheduled run.
 

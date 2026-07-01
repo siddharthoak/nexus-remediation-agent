@@ -1,9 +1,9 @@
 # OSS Vulnerability Remediation Agent
 
-Automated pipeline that fetches Nexus IQ vulnerability reports for a Java/Maven
-repository, upgrades vulnerable dependencies, fixes any resulting code breakage using
-Claude, opens a GitHub PR, and iteratively retries CI failures — all deployed as
-Hosted Agents on Azure AI Foundry.
+Automated pipeline that fetches Nexus IQ vulnerability reports for a repository
+(Maven, Gradle, npm, or Python — auto-detected), upgrades vulnerable dependencies,
+fixes any resulting code breakage using Claude, opens a GitHub PR, and iteratively
+retries CI failures — all deployed as Hosted Agents on Azure AI Foundry.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ Fixer Agent (scheduled)          Watcher Agent (poll-driven)
 ──────────────────────────        ──────────────────────────────
 1. Fetch Nexus IQ report          1. Poll CI status on open PRs
 2. Clone repo, create branch      2. CI passed → leave for review
-3. Bump pom.xml version           3. CI failed → call Claude to
+3. Bump dependency manifest        3. CI failed → call Claude to
 4. Call Claude to fix code           diagnose + apply minimal fix
 5. Commit, push, open PR          4. Push fix to same branch
 6. Record PR state                5. Repeat up to MAX_RETRY_ATTEMPTS
