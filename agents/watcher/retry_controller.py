@@ -178,7 +178,15 @@ class RetryController:
             self._escalate_unrelated_failure(pr_number, diagnosis)
             return False
 
-        # Step 2: Apply the proposed fix
+        # Step 2: Increment the attempt counter for every upgrade-caused diagnosis, whether
+        # or not the proposed patch can actually be applied. Counting only successful
+        # applies would let a diagnosis that keeps proposing patches against a stale/
+        # mismatched find-string burn unlimited real API calls without ever tripping the
+        # hard bound checked at the top of this method — this is what makes "NEVER exceeds
+        # MAX_RETRY_ATTEMPTS even if called again" (module docstring) actually hold.
+        new_count = self._counter.increment(pr_number)
+
+        # Step 3: Apply the proposed fix
         files_changed = self._apply_diagnosis_changes(diagnosis)
 
         if not files_changed:
@@ -187,11 +195,9 @@ class RetryController:
                 "Escalating.", pr_number,
             )
             self._escalate_no_changes(pr_number, diagnosis)
+            if new_count >= self._max_attempts:
+                self._escalate_limit_approaching(pr_number, new_count)
             return False
-
-        # Step 3: Increment attempt counter BEFORE pushing
-        # (so a push failure doesn't leave the counter un-incremented on retry)
-        new_count = self._counter.increment(pr_number)
 
         # Step 4: Commit and push to the SAME branch (never a new branch, never force-push)
         commit_msg = (

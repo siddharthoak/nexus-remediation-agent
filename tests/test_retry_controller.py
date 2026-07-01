@@ -66,14 +66,31 @@ def _make_ci_result(pr_number: int = 1, failure_log: str = "Build failed: cannot
     )
 
 
+_APP_JAVA_ORIGINAL = "import org.apache.log4j.Logger;\npublic class App { }"
+
+
+def _reset_app_java(repo_dir: str) -> None:
+    """
+    Restore App.java to its pre-fix content.
+
+    MOCK_DIAGNOSIS_UPGRADE_CAUSED carries a fixed `find` string. In production each retry
+    gets a fresh model diagnosis reflecting the file's current (already-partially-fixed)
+    state; these tests reuse one canned diagnosis across several attempt_fix() calls to
+    isolate counter/bound behavior, so the file must be reset between calls or the second
+    call's find-string legitimately won't match anymore (it was already replaced by the
+    first call) — that's not a bug, it's apply_diagnosis_changes() correctly refusing to
+    reapply a stale patch.
+    """
+    app_java = Path(repo_dir) / "src" / "main" / "java" / "com" / "example" / "App.java"
+    app_java.write_text(_APP_JAVA_ORIGINAL, encoding="utf-8")
+
+
 @pytest.fixture
 def repo_dir():
     tmpdir = tempfile.mkdtemp(prefix="test-watcher-")
     src = Path(tmpdir) / "src" / "main" / "java" / "com" / "example"
     src.mkdir(parents=True)
-    (src / "App.java").write_text(
-        "import org.apache.log4j.Logger;\npublic class App { }", encoding="utf-8"
-    )
+    (src / "App.java").write_text(_APP_JAVA_ORIGINAL, encoding="utf-8")
     yield tmpdir
     shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -151,9 +168,11 @@ class TestRetryCountIncrementsCorrectly:
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
         assert counter.get(pr_number) == 1
 
+        _reset_app_java(repo_dir)
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
         assert counter.get(pr_number) == 2
 
+        _reset_app_java(repo_dir)
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
         assert counter.get(pr_number) == 3
 
@@ -162,7 +181,9 @@ class TestRetryCountIncrementsCorrectly:
         controller, _, _, counter = _make_controller(repo_dir, MOCK_DIAGNOSIS_UPGRADE_CAUSED, max_retries=5)
 
         controller.attempt_fix(_make_ci_result(pr_number=1), branch_name="fix/a")
+        _reset_app_java(repo_dir)
         controller.attempt_fix(_make_ci_result(pr_number=2), branch_name="fix/b")
+        _reset_app_java(repo_dir)
         controller.attempt_fix(_make_ci_result(pr_number=1), branch_name="fix/a")
 
         assert counter.get(1) == 2
@@ -187,7 +208,9 @@ class TestHardRetryBound:
 
         # Attempts 1, 2, 3 should succeed
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
+        _reset_app_java(repo_dir)
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
+        _reset_app_java(repo_dir)
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
 
         assert counter.get(pr_number) == 3
@@ -212,6 +235,7 @@ class TestHardRetryBound:
         pr_number = 77
 
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
+        _reset_app_java(repo_dir)
         controller.attempt_fix(_make_ci_result(pr_number=pr_number), branch_name="fix/test")
 
         # Now at limit — next 3 calls must all raise and must not push
