@@ -1,0 +1,5 @@
+anthropic>=0.40.0
+requests>=2.31.0
+GitPython>=3.1.41
+PyGithub>=2.1.1
+lxml>=4.9.0

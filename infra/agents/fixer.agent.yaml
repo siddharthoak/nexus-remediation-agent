@@ -1,0 +1,61 @@
+# Fixer Agent — Azure AI Foundry Hosted Agent definition
+#
+# All {{PLACEHOLDER}} values are substituted by scripts/update_agent.py at deploy time.
+# Edit config.yaml (copied from config.yaml.example) to change any of these values —
+# do not edit the placeholders in this file directly.
+#
+# IMPORTANT: Validate this file's schema against current AAF Hosted Agent documentation
+# before deploying: https://learn.microsoft.com/en-us/azure/ai-foundry/agents/hosted-agents
+
+name: nexus-fixer-agent
+description: "Fetches Nexus IQ vulnerability reports, upgrades dependencies, fixes code breakage, and opens a GitHub PR."
+
+container:
+  image: "{{ACR_LOGIN_SERVER}}/fixer-agent:{{IMAGE_TAG}}"
+
+trigger:
+  schedule: "{{FIXER_SCHEDULE}}"
+
+environment:
+  - name: NEXUS_IQ_ENDPOINT
+    value: "{{NEXUS_IQ_ENDPOINT}}"
+
+  - name: NEXUS_IQ_APP_PUBLIC_ID
+    value: "{{NEXUS_IQ_APP_PUBLIC_ID}}"
+
+  - name: GITHUB_REPO_TARGET
+    value: "{{GITHUB_REPO_TARGET}}"
+
+  - name: MODEL_DEPLOYMENT_NAME
+    value: "{{MODEL_DEPLOYMENT_NAME}}"
+
+  - name: COSMOS_ENDPOINT
+    value: "{{COSMOS_ENDPOINT}}"
+
+  - name: COSMOS_DATABASE
+    value: "{{COSMOS_DATABASE}}"
+
+  - name: COSMOS_CONTAINER
+    value: "{{COSMOS_CONTAINER}}"
+
+  - name: MAX_RETRY_ATTEMPTS
+    value: "{{MAX_RETRY_ATTEMPTS}}"
+
+  # Secrets — referenced from Key Vault, never hardcoded.
+  # TODO: Confirm Key Vault reference syntax against current AAF Hosted Agent docs.
+  - name: NEXUS_IQ_API_KEY
+    secretRef:
+      keyVaultUri: "{{KEY_VAULT_URI}}"
+      secretName: "{{NEXUS_IQ_API_KEY_SECRET_NAME}}"
+
+  - name: GITHUB_PAT
+    secretRef:
+      keyVaultUri: "{{KEY_VAULT_URI}}"
+      secretName: "{{GITHUB_PAT_SECRET_NAME}}"
+
+resources:
+  cpu: 1
+  memoryGb: 2
+
+identity:
+  type: SystemAssigned

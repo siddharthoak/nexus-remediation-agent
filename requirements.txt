@@ -1,0 +1,25 @@
+# Core dependencies — shared across fixer and watcher agents
+anthropic>=0.40.0
+requests>=2.31.0
+GitPython>=3.1.41
+PyGithub>=2.1.1
+lxml>=4.9.0
+
+# Config parsing — used by scripts/update_agent.py and bootstrap script
+PyYAML>=6.0.1
+
+# Azure SDK — used by scripts/update_agent.py and watcher/cosmos_counter.py
+azure-ai-projects>=1.0.0b1
+azure-cosmos>=4.7.0
+azure-identity>=1.15.0
+
+# Dashboard (OBS-01) — local only, not installed in agent containers
+streamlit>=1.35.0
+pandas>=2.2.0
+
+# Testing
+pytest>=8.0.0
+pytest-cov>=4.1.0
+
+# Linting (CI)
+ruff>=0.3.0

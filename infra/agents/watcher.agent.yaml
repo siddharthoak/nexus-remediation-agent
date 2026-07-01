@@ -1,0 +1,62 @@
+# Watcher Agent — Azure AI Foundry Hosted Agent definition
+#
+# All {{PLACEHOLDER}} values are substituted by scripts/update_agent.py at deploy time.
+# Edit config.yaml (copied from config.yaml.example) to change any of these values —
+# do not edit the placeholders in this file directly.
+#
+# IMPORTANT: Validate this file's schema against current AAF Hosted Agent documentation
+# before deploying: https://learn.microsoft.com/en-us/azure/ai-foundry/agents/hosted-agents
+
+name: nexus-watcher-agent
+description: "Monitors CI status on remediation PRs and invokes the Fixer for informed retries up to MAX_RETRY_ATTEMPTS times."
+
+container:
+  image: "{{ACR_LOGIN_SERVER}}/watcher-agent:{{IMAGE_TAG}}"
+
+trigger:
+  schedule: "{{WATCHER_SCHEDULE}}"
+
+environment:
+  - name: GITHUB_REPO_TARGET
+    value: "{{GITHUB_REPO_TARGET}}"
+
+  - name: MAX_RETRY_ATTEMPTS
+    value: "{{MAX_RETRY_ATTEMPTS}}"
+
+  - name: CI_POLL_INTERVAL
+    value: "{{CI_POLL_INTERVAL}}"
+
+  - name: CI_TIMEOUT_SECONDS
+    value: "{{CI_TIMEOUT_SECONDS}}"
+
+  - name: COSMOS_ENDPOINT
+    value: "{{COSMOS_ENDPOINT}}"
+
+  - name: COSMOS_DATABASE
+    value: "{{COSMOS_DATABASE}}"
+
+  - name: COSMOS_CONTAINER
+    value: "{{COSMOS_CONTAINER}}"
+
+  # Used by AafFixerInvoker to trigger a Fixer retry run.
+  # FIXER_AGENT_ID is obtained after the first Fixer agent deploy;
+  # set it in config.yaml and re-run update_agent.py.
+  - name: FIXER_AGENT_ID
+    value: "{{FIXER_AGENT_ID}}"
+
+  - name: PROJECT_ENDPOINT
+    value: "{{PROJECT_ENDPOINT}}"
+
+  # Secrets — referenced from Key Vault, never hardcoded.
+  # TODO: Confirm Key Vault reference syntax against current AAF Hosted Agent docs.
+  - name: GITHUB_PAT
+    secretRef:
+      keyVaultUri: "{{KEY_VAULT_URI}}"
+      secretName: "{{GITHUB_PAT_SECRET_NAME}}"
+
+resources:
+  cpu: 1
+  memoryGb: 2
+
+identity:
+  type: SystemAssigned

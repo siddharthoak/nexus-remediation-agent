@@ -1,0 +1,46 @@
+# CI for this repo — lints and tests OUR orchestration code.
+# This is separate from the customer's CI pipeline that the Fixer agent's PRs will trigger.
+
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check agents/ scripts/ tests/
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short --cov=agents --cov-report=term-missing
+
+  bicep-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Validate Bicep syntax
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null

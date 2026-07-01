@@ -1,0 +1,60 @@
+# OSS Remediation Agent — Central Configuration
+#
+# HOW TO USE:
+#   1. cp config.yaml.example config.yaml
+#   2. Fill in every value marked  ← SET THIS
+#   3. Run:  bash scripts/bootstrap_foundry_project.sh
+#      (populates the 'infra:' section automatically)
+#   4. Run:  python3 scripts/update_agent.py
+#
+# config.yaml is gitignored — never commit it (it contains live infra endpoints).
+# This example file is the committed reference; keep it in sync with config.yaml.
+
+# ── Azure AI Foundry ──────────────────────────────────────────────────────────
+foundry:
+  project_endpoint: ""                # ← SET THIS after creating the Foundry project
+                                      #   e.g. https://<hub>.services.ai.azure.com/api/projects/<project>
+  model_deployment_name: "claude-deployment"  # ← SET THIS: name of the model deployment in AAF
+  fixer_agent_id: ""                  # ← SET THIS after first deploy of the Fixer agent
+                                      #   needed so the Watcher can invoke the Fixer for retries
+
+# ── GitHub ────────────────────────────────────────────────────────────────────
+github:
+  repo_target: "org/repo-name"        # ← SET THIS: target repo in "owner/repo" format
+
+# ── Nexus IQ ─────────────────────────────────────────────────────────────────
+nexus:
+  endpoint: "https://your-nexus-iq-server/api/v2"   # ← SET THIS: Nexus IQ Server base URL
+  app_public_id: "your-app-public-id"               # ← SET THIS: Nexus IQ application public ID
+
+# ── Agent schedules (cron syntax, UTC) ───────────────────────────────────────
+schedules:
+  fixer:   "0 2 * * 1"      # Default: every Monday at 02:00 UTC
+  watcher: "*/15 * * * *"   # Default: every 15 minutes
+
+# ── Runtime settings ─────────────────────────────────────────────────────────
+runtime:
+  max_retry_attempts: "3"          # Hard upper bound on CI-fix retry cycles per PR
+  ci_poll_interval: "30"           # Seconds between CI status checks
+  ci_timeout_seconds: "1800"       # Max seconds to wait for CI before giving up (30 min)
+  cosmos_database: "oss-remediation"
+  cosmos_container: "tracking-records"
+
+# ── Key Vault secret names ────────────────────────────────────────────────────
+# These are the NAMES of the secrets inside Key Vault, not the values themselves.
+# Set the actual secret values with:
+#   az keyvault secret set --vault-name <name> --name <secret-name> --value <value>
+secrets:
+  nexus_iq_api_key: "nexus-iq-api-key"
+  github_pat: "github-pat"
+
+# ── Infrastructure ────────────────────────────────────────────────────────────
+# Populated automatically by scripts/bootstrap_foundry_project.sh.
+# Do not edit this section manually.
+infra:
+  acr_login_server: ""
+  acr_name: ""
+  key_vault_uri: ""
+  key_vault_name: ""
+  cosmos_endpoint: ""
+  azure_resource_group: ""
