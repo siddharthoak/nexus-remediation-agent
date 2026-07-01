@@ -18,7 +18,6 @@ survive container restarts and be shared across all agent instances, which requi
 Cosmos DB. For local development, InMemoryKBStore is sufficient (preloaded from playbooks).
 """
 
-import json
 import logging
 import os
 import uuid

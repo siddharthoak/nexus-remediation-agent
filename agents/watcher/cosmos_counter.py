@@ -34,7 +34,7 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from azure.cosmos import CosmosClient, PartitionKey, exceptions as cosmos_exc
+from azure.cosmos import CosmosClient, exceptions as cosmos_exc
 from azure.identity import DefaultAzureCredential
 
 logger = logging.getLogger(__name__)

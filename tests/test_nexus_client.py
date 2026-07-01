@@ -8,11 +8,11 @@ They are intentionally isolated in fixtures so they can be updated in ONE place
 once the real schema is confirmed (see FIX-01 / nexus_client.py for TODOs).
 """
 
-import json
 import pytest
 from unittest.mock import patch, MagicMock
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "fixer"))
 
 from nexus_client import NexusIQClient, NexusAuthError, NexusReportParseError
