@@ -17,6 +17,12 @@ trigger:
   schedule: "{{FIXER_SCHEDULE}}"
 
 environment:
+  # Pins the store/vulnerability-source backend selection explicitly rather than
+  # relying on the "unset" fallback (Cosmos/NexusIQClient if COSMOS_ENDPOINT/
+  # NEXUS_IQ_ENDPOINT happen to be set) — see PLAN.md section 4.4a.
+  - name: DEPLOYMENT_MODE
+    value: "azure"
+
   - name: NEXUS_IQ_ENDPOINT
     value: "{{NEXUS_IQ_ENDPOINT}}"
 
@@ -52,6 +58,15 @@ environment:
     secretRef:
       keyVaultUri: "{{KEY_VAULT_URI}}"
       secretName: "{{GITHUB_PAT_SECRET_NAME}}"
+
+  # code_fixer.py and the inline Knowledge Agent both call anthropic.Anthropic(),
+  # which reads this env var directly — required even though MODEL_DEPLOYMENT_NAME
+  # names a model deployed inside the Foundry project (that name is passed as the
+  # `model` argument to messages.create(); it does not by itself supply auth).
+  - name: ANTHROPIC_API_KEY
+    secretRef:
+      keyVaultUri: "{{KEY_VAULT_URI}}"
+      secretName: "{{ANTHROPIC_API_KEY_SECRET_NAME}}"
 
 resources:
   cpu: 1

@@ -117,6 +117,7 @@ def build_substitutions(cfg: dict, image_tag: str) -> dict:
         # Key Vault secret names
         "NEXUS_IQ_API_KEY_SECRET_NAME": env_or("NEXUS_IQ_API_KEY_SECRET_NAME", cfg["secrets"]["nexus_iq_api_key"]),
         "GITHUB_PAT_SECRET_NAME":       env_or("GITHUB_PAT_SECRET_NAME",       cfg["secrets"]["github_pat"]),
+        "ANTHROPIC_API_KEY_SECRET_NAME": env_or("ANTHROPIC_API_KEY_SECRET_NAME", cfg["secrets"]["anthropic_api_key"]),
 
         # Computed at deploy time
         "IMAGE_TAG": image_tag,

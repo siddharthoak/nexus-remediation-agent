@@ -1,11 +1,9 @@
-# Local Testing Guide — Fixer Multi-Framework Support (Podman)
-
-For Docker instead of Podman, see: TESTING_DOCKER.md
+# Local Testing Guide — Fixer Multi-Framework Support (Docker)
 
 This walks through validating the Fixer's build framework abstraction
 (`agents/fixer/frameworks/` — see PLAN.md section 4.7) on a local machine using
-Podman instead of Docker. Commands are 1:1 with Docker's CLI; swap `podman` for
-`docker` if you'd rather use Docker Desktop.
+Docker. Commands are 1:1 with Podman's CLI (see TESTING_PODMAN.md); swap `docker`
+for `podman` if you'd rather use Podman.
 
 Everything in Steps 1–4 runs with **no external credentials** (no Anthropic key, no
 GitHub PAT, no Nexus IQ key, no Azure/Cosmos). Step 5 is optional and requires real
@@ -15,17 +13,27 @@ credentials for a true end-to-end run.
 
 ## 0. Prerequisites
 
-Install Podman and start its VM (macOS/Windows only — Podman needs a Linux VM to run
-containers, unlike Docker Desktop which bundles one):
+Install Docker Desktop (macOS/Windows) or the Docker Engine (Linux):
 
 ```bash
-brew install podman
-podman machine init
-podman machine start
-podman info   # sanity check — should print without errors
+# macOS/Windows: install Docker Desktop from
+#   https://www.docker.com/products/docker-desktop
+# Linux:
+apt install docker.io        # Debian/Ubuntu
+dnf install docker-ce         # Fedora/RHEL (or Docker's official repo)
 ```
 
-On Linux, `podman` runs natively — skip the `podman machine` steps.
+Docker Desktop bundles its own Linux VM on macOS/Windows, so unlike Podman there's
+no separate "machine init/start" step — start Docker Desktop and it's ready to use.
+
+```bash
+docker info   # sanity check — should print without errors
+```
+
+On Linux, either run as `sudo` or add your user to the `docker` group so `docker`
+works without `sudo` — see
+`https://docs.docker.com/engine/install/linux-postinstall/` if `docker info` fails
+with a permission error.
 
 ---
 
@@ -34,14 +42,20 @@ On Linux, `podman` runs natively — skip the `podman machine` steps.
 From the repo root:
 
 ```bash
-podman build -f agents/fixer/Dockerfile -t fixer-agent-local .
+docker build -f agents/fixer/Dockerfile -t fixer-agent-local .
 ```
 
 This installs all four supported runtimes into one image (JDK 17 + Maven, Node 20 +
 npm, Python 3.11) and runs a build-time smoke test as the last `RUN` step — if any
-runtime is missing, `podman build` itself fails here rather than failing later at
-container runtime. A clean build ending in `COMMIT` / `Successfully tagged` confirms
-this passed.
+runtime is missing, `docker build` itself fails here rather than failing later at
+container runtime. A clean build ending in `naming to docker.io/library/fixer-agent-local`
+/ `Successfully tagged` confirms this passed.
+
+The same image also bundles `agents/knowledge_agent/` and `agents/classifier/` —
+those two have no `Dockerfile` of their own; `agents/fixer/main.py` imports
+`KnowledgeAgent`/`Classifier` directly and runs them in-process, so their source
+just needs to be on disk inside the Fixer's container (see section 6 for why this
+matters for what you can and can't observe locally).
 
 ---
 
@@ -50,7 +64,7 @@ this passed.
 Confirm all four runtimes are actually present and the expected versions:
 
 ```bash
-podman run --rm fixer-agent-local bash -c '
+docker run --rm fixer-agent-local bash -c '
   java -version
   echo ---
   mvn --version | head -3
@@ -113,7 +127,7 @@ public class App {
 }
 EOF
 
-podman run --rm -v /tmp/fixer-smoke:/smoke:Z -w /app fixer-agent-local python3 -c '
+docker run --rm -v /tmp/fixer-smoke:/smoke -w /app fixer-agent-local python3 -c '
 import sys
 sys.path.insert(0, ".")
 from pathlib import Path
@@ -136,10 +150,17 @@ print("test status:", test_result.status)  # expect NO_TESTS_FOUND — no src/te
 '
 ```
 
+Note: the `:Z` SELinux relabel suffix used in TESTING_PODMAN.md's volume mounts is
+omitted here — it's specific to rootless Podman on SELinux-enabled Linux hosts
+(Fedora/RHEL). Docker doesn't need it; on a Linux host with SELinux enforcing and
+Docker configured to honor SELinux labels, add `:z` (lowercase, shared) if you hit a
+permission-denied error reading `/smoke` inside the container.
+
 Expected: `detected framework: maven`, `manifest bumped: pom.xml`, `build success:
 True` (the trivial `App.java` compiles cleanly with `mvn compile` once `commons-lang3`
 resolves from Maven Central), and `test status: NO_TESTS_FOUND` (no `src/test/java`
-directory in this fixture). This was verified end-to-end while writing this guide.
+directory in this fixture). This was verified end-to-end while writing the Podman
+version of this guide (TESTING_PODMAN.md); the commands are otherwise identical.
 
 Repeat with a `package.json` (`{"name":"demo","dependencies":{"lodash":"^4.17.15"}}`)
 or a `requirements.txt` (`flask==2.0.0`) dropped into a fresh subdirectory of
@@ -162,7 +183,7 @@ installed.
 **Inside the container (recommended — matches the deployed environment exactly):**
 
 ```bash
-podman run --rm -v "$(pwd)":/repo:Z -w /repo fixer-agent-local bash -c '
+docker run --rm -v "$(pwd)":/repo -w /repo fixer-agent-local bash -c '
   pip install --quiet pytest
   pytest tests/test_frameworks.py tests/test_code_fixer.py -v
 '
@@ -200,8 +221,8 @@ a prior run of a different agent, or a GitHub Actions scan artifact), point `SCA
 at that directory — no need to regenerate them:
 
 ```bash
-podman run --rm \
-  -v /path/to/existing/scan-reports:/reports:Z \
+docker run --rm \
+  -v /path/to/existing/scan-reports:/reports \
   -e DEPLOYMENT_MODE=local \
   -e SCAN_REPORT_PATH=/reports \
   -e GITHUB_REPO_TARGET=<org>/<repo> \
@@ -218,7 +239,7 @@ in this mode — `ScanReportClient` ignores it.
 ### 5b. Have a real Nexus IQ Server? Use `DEPLOYMENT_MODE=azure`
 
 ```bash
-podman run --rm \
+docker run --rm \
   -e DEPLOYMENT_MODE=azure \
   -e NEXUS_IQ_ENDPOINT=<your-nexus-iq-base-url> \
   -e NEXUS_IQ_API_KEY=<your-nexus-iq-key> \
@@ -251,9 +272,9 @@ inside the Fixer (`agents/fixer/main.py`), not separate containers or services.
 This section adds the **Watcher** into the loop, which is the part that actually
 requires two separate container runs to coordinate with each other.
 
-Uses `docker-compose.e2e.yml` (repo root, works with `podman compose` unchanged) —
-two one-shot services, `fixer` and `watcher`, both built from this repo and sharing
-one `.env` file. Neither is a long-running server, so use `run --rm`, not `up`.
+Uses `docker-compose.e2e.yml` (repo root) — two one-shot services, `fixer` and
+`watcher`, both built from this repo and sharing one `.env` file. Neither is a
+long-running server, so use `run --rm`, not `up`.
 
 ### 6.0 Why this needs a real Cosmos DB account (not the Emulator)
 
@@ -299,10 +320,7 @@ automatic retry exercised — see 6.3–6.4 for why.
 
 3. Make `DefaultAzureCredential` resolve *inside* the container. Two options:
    - **Quick / local dev**: run `az login` on your host, then mount your Azure CLI
-     credentials into the container (added to the run commands below). On rootless
-     Podman, if the container can't read the mounted files because of UID
-     remapping, use the service-principal option instead rather than fighting
-     `podman unshare`/`:U` volume options.
+     credentials into the container (added to the run commands below).
    - **Cleaner / CI-friendly**: create a service principal scoped to the Cosmos
      account and add these to `.env` instead — `DefaultAzureCredential` picks them
      up automatically, no volume mount needed:
@@ -315,9 +333,9 @@ automatic retry exercised — see 6.3–6.4 for why.
 ### 6.2 Run the Fixer — opens a PR, state now lands in Cosmos
 
 ```bash
-podman compose -f docker-compose.e2e.yml build fixer watcher
+docker compose -f docker-compose.e2e.yml build fixer watcher
 
-podman compose -f docker-compose.e2e.yml run --rm \
+docker compose -f docker-compose.e2e.yml run --rm \
   -v ~/.azure:/root/.azure:ro \
   fixer
 ```
@@ -336,7 +354,7 @@ section 5).
 ### 6.3 Run the Watcher — sees the PR, detects the CI failure
 
 ```bash
-podman compose -f docker-compose.e2e.yml run --rm \
+docker compose -f docker-compose.e2e.yml run --rm \
   -v ~/.azure:/root/.azure:ro \
   watcher
 ```
@@ -403,12 +421,12 @@ hydrated during the Fixer's fresh scan.
 ## Cleanup
 
 ```bash
-podman rmi fixer-agent-local
+docker rmi fixer-agent-local
 rm -rf /tmp/fixer-smoke
 ```
 
 If you also ran section 6:
 
 ```bash
-podman compose -f docker-compose.e2e.yml down --rmi local
+docker compose -f docker-compose.e2e.yml down --rmi local
 ```

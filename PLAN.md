@@ -54,16 +54,17 @@ nexus-remediation-agent/
 │   │   ├── Dockerfile                  ← lightweight; no Maven, no git
 │   │   ├── main.py                     ← reads Nexus report; applies ignore/known lists; creates Issues for filtered findings; outputs actionable list
 │   │   └── list_filter.py              ← loads ignore_list.yaml + known_list.yaml; matches against findings; no model calls
-│   ├── knowledge_agent/
-│   │   ├── Dockerfile                  ← lightweight; web search tools only
+│   ├── knowledge_agent/                ← no Dockerfile — runs in-process inside the Fixer container
 │   │   ├── main.py                     ← per-(component, old_version, new_version): web search → parse → KB write
 │   │   └── retrieval.py                ← web search scoped to trusted domains; structured extraction
 │   ├── classifier/                     ← runs after KB hydration; classification is now KB-informed
-│   │   ├── Dockerfile                  ← lightweight; no Maven, no git
-│   │   ├── main.py                     ← reads KB entries per finding; assigns bucket; creates Issues for non-fixable; invokes Fixer for fixable
+│   │   │                                  no Dockerfile, no main.py — runs in-process inside the Fixer container
 │   │   └── rules.py                    ← bucket logic informed by KB data; buckets 3/4 require KB entry to distinguish
 │   ├── fixer/
-│   │   ├── Dockerfile                  ← multi-runtime base: JDK 17 + Maven, Node 20 + npm, Python 3.11
+│   │   ├── Dockerfile                  ← multi-runtime base: JDK 17 + Maven, Node 20 + npm, Python 3.11;
+│   │   │                                  also COPYs in knowledge_agent/ and classifier/ source (imported
+│   │   │                                  in-process — see main.py's `from knowledge_agent.main import
+│   │   │                                  KnowledgeAgent` / `from classifier.rules import Classifier`)
 │   │   ├── instructions.md
 │   │   ├── main.py                     ← two trigger modes; parallel fresh scan + Watcher retry
 │   │   ├── nexus_client.py             ← NexusIQClient + make_vulnerability_source() factory (see 4.4a)
@@ -100,9 +101,9 @@ nexus-remediation-agent/
 
 ### Why this split
 
-- **`infra/main.bicep`** — declares the Azure resources that must exist before any agent can run: ACR (container images), Key Vault (PAT \+ Nexus IQ key), and Cosmos DB Serverless account with the `oss-remediation` database and `tracking-records` container (90-day TTL, partition key `/id`). Does not provision the Foundry project itself — only references an existing one.  
+- **`infra/main.bicep`** — declares the Azure resources that must exist before any agent can run: ACR (container images), Key Vault (GitHub PAT \+ Nexus IQ key \+ Anthropic API key), and Cosmos DB Serverless account with the `oss-remediation` database and `tracking-records` container (90-day TTL, partition key `/id`). Does not provision the Foundry project itself — only references an existing one.  
     
-- **`infra/agents/*.agent.yaml`** — Hosted Agent definition files (name, container image reference, cron schedule, env vars, Key Vault secret references, identity scopes). The Watcher yaml adds `COSMOS_ENDPOINT`, `COSMOS_DATABASE`, `COSMOS_CONTAINER`, and `MAX_RETRY_ATTEMPTS`; the Fixer yaml adds `NEXUS_IQ_APP_PUBLIC_ID`, `GITHUB_REPO_TARGET`, and `MODEL_DEPLOYMENT_NAME`.  
+- **`infra/agents/*.agent.yaml`** — Hosted Agent definition files (name, container image reference, cron schedule, env vars, Key Vault secret references, identity scopes). Both agent yaml files set `DEPLOYMENT_MODE=azure` directly (a fixed constant, not templated from config — see section 4.4a) to pin the store/vulnerability-source backend selection explicitly rather than relying on the "unset" fallback. The Watcher yaml adds `COSMOS_ENDPOINT`, `COSMOS_DATABASE`, `COSMOS_CONTAINER`, and `MAX_RETRY_ATTEMPTS`; the Fixer yaml adds `NEXUS_IQ_APP_PUBLIC_ID`, `GITHUB_REPO_TARGET`, `MODEL_DEPLOYMENT_NAME`, and an `ANTHROPIC_API_KEY` Key Vault `secretRef` — required because `code_fixer.py` and the inline Knowledge Agent both call `anthropic.Anthropic()`, which reads that env var directly regardless of `MODEL_DEPLOYMENT_NAME` naming a Foundry-hosted deployment.  
     
 - **`agents/common/`** — a shared Python package copied into all container images at build time (see Dockerfiles). No agent has a runtime dependency on another's container. Contains the tracking store abstraction (all agents read/write) and the knowledge store abstraction (Classifier, Knowledge Init, and Fixer read/write KB entries).  
     
@@ -111,21 +112,21 @@ nexus-remediation-agent/
 
 - **`agents/discovery/`** _(deferred — not yet built)_ — planned as the entry point for every scan run. Will read the Nexus IQ report and immediately apply `ignore_list.yaml` and `known_list.yaml` against each finding. Any matching finding gets a GitHub Issue (reason: accepted risk, blocked upgrade, EOL) and is written as an `IGNORED` or `KNOWN_BLOCKED` tracking record, then dropped from further processing. No model calls, no KB access, no classification. **Current state:** the Fixer's `_run_fresh_scan()` fetches the Nexus report directly and passes all findings to the Knowledge Agent. Findings that would be filtered by Discovery instead land in the Classifier, where Bucket 1 catches the "no safe version" case as a triage issue. The ignore/known-list pre-filter — which avoids spending KB tokens on accepted-risk findings — is the gap. Discovery becomes valuable once the customer provides their first ignore/known lists. Until then, all findings flow through the full pipeline harmlessly.
 
-- **`agents/knowledge_agent/`** — runs after Discovery, for every actionable finding. For each `(component, old_version, new_version)` triple, checks whether a KB entry already exists; if not, queries official release notes and migration guides via web search scoped to trusted domains, parses the results into structured migration intelligence (removed APIs, changed signatures, new imports), and writes the entry to the Knowledge Store. A no-op if the KB already has an entry for that version pair. Runs as a lightweight container with no Maven and no git.
+- **`agents/knowledge_agent/`** — runs after Discovery, for every actionable finding. For each `(component, old_version, new_version)` triple, checks whether a KB entry already exists; if not, queries official release notes and migration guides via web search scoped to trusted domains, parses the results into structured migration intelligence (removed APIs, changed signatures, new imports), and writes the entry to the Knowledge Store. A no-op if the KB already has an entry for that version pair. **Not a separate container**: `agents/fixer/main.py` imports `KnowledgeAgent` from `knowledge_agent.main` directly and runs it in-process at the start of a fresh scan; there is no `knowledge_agent/Dockerfile` — its source is copied into the Fixer's own image instead (`COPY agents/knowledge_agent/` in `agents/fixer/Dockerfile`).
 
-- **`agents/classifier/`** — runs after KB hydration, not before. This is where actual bucket assignment happens, and it happens with KB data available. `rules.py` reads the KB entry for each finding and applies classification rules: Bucket 1 (no safe path) is detectable without KB; Buckets 3 and 4 (major with vs. without known migration path) are only distinguishable once the KB has been queried. Invokes the Fixer for fixable findings (Buckets 2 and 3). Writes bucket + rationale to the tracking record.
+- **`agents/classifier/`** — runs after KB hydration, not before. This is where actual bucket assignment happens, and it happens with KB data available. `rules.py` reads the KB entry for each finding and applies classification rules: Bucket 1 (no safe path) is detectable without KB; Buckets 3 and 4 (major with vs. without known migration path) are only distinguishable once the KB has been queried. Invokes the Fixer for fixable findings (Buckets 2 and 3). Writes bucket + rationale to the tracking record. Like the Knowledge Agent, this is **not a separate container** — `agents/fixer/main.py` imports `Classifier` from `classifier.rules` directly; there is no `classifier/main.py` or `classifier/Dockerfile`, only `rules.py`, and its source is copied into the Fixer's image the same way.
 
   GitHub Issue creation differs by bucket type:
   - **Bucket 1** (no safe path — no Nexus remediation target, transitive dep, EOL): Issue created without a model call. The reason is derivable directly from Nexus data; no KB content is needed.
   - **Bucket 4** (complex/framework-level): Issue content is Claude-generated. The Classifier reads the KB entry for this finding — which the Knowledge Agent hydrated from web sources — and asks Claude to produce a structured analysis: known breaking changes, what coordination across dependencies is required, and suggested starting points for the engineer. The Issue contains this analysis, not a bare "too complex" message. Framework-level upgrades (Spring Boot, Angular major, Hibernate) always land here regardless of KB content — the KB analysis is surfaced in the Issue but the Fixer is never invoked.
 
-- **`agents/fixer/`** — the only component that ever writes code or pushes git commits. `main.py` has two trigger modes selected at startup by the `RETRY_TRACKING_ID` env var: fresh scan (scheduler-triggered) and Watcher-triggered retry. Fresh scans run all findings in parallel via `ThreadPoolExecutor` (up to `MAX_PARALLEL_FIXES = 5` concurrent workers): the repo is cloned once from GitHub, then each worker gets a fast local copy via `clone_local()` — which uses filesystem hardlinks and re-points `origin` to GitHub for push. Tracking records are created before the pool starts so store access stays sequential. `code_fixer.py` exposes two public entry points (`run_fresh_fix`, `run_retry_fix`) and raises `InvalidRetryError` if the tracking record fails validation — the Fixer's own second line of defence against being invoked improperly. On startup, `detect_framework(repo_path)` inspects the repository root and returns the appropriate `BuildFramework` implementation; all subsequent build and test calls go through this abstraction. The tool-use loop exposes **five tools** (up to `MAX_TOOL_ROUNDS = 10`): `grep_files`, `read_file`, `apply_file_change` (same as before), plus `run_build` (delegates to the detected framework's compile/typecheck command) and `run_unit_tests` (delegates to the framework's unit-only test command). The PR is opened only after `run_build` returns SUCCESS and `run_unit_tests` returns SUCCESS or NO_TESTS_FOUND. Prompt templates (`FRESH_FIX_PROMPT`, `RETRY_FIX_PROMPT`) are module-level strings, not buried logic, so they diff cleanly in PRs. The Fixer Docker image installs all supported runtimes (JDK 17 + Maven, Node 20 + npm, Python 3.11 + pip); the Watcher and Classifier images remain lightweight.  
+- **`agents/fixer/`** — the only component that ever writes code or pushes git commits. `main.py` has two trigger modes selected at startup by the `RETRY_TRACKING_ID` env var: fresh scan (scheduler-triggered) and Watcher-triggered retry. Fresh scans run all findings in parallel via `ThreadPoolExecutor` (up to `MAX_PARALLEL_FIXES = 5` concurrent workers): the repo is cloned once from GitHub, then each worker gets a fast local copy via `clone_local()` — which uses filesystem hardlinks and re-points `origin` to GitHub for push. Tracking records are created before the pool starts so store access stays sequential. `code_fixer.py` exposes two public entry points (`run_fresh_fix`, `run_retry_fix`) and raises `InvalidRetryError` if the tracking record fails validation — the Fixer's own second line of defence against being invoked improperly. On startup, `detect_framework(repo_path)` inspects the repository root and returns the appropriate `BuildFramework` implementation; all subsequent build and test calls go through this abstraction. The tool-use loop exposes **five tools** (up to `MAX_TOOL_ROUNDS = 10`): `grep_files`, `read_file`, `apply_file_change` (same as before), plus `run_build` (delegates to the detected framework's compile/typecheck command) and `run_unit_tests` (delegates to the framework's unit-only test command). The PR is opened only after `run_build` returns SUCCESS and `run_unit_tests` returns SUCCESS or NO_TESTS_FOUND. Prompt templates (`FRESH_FIX_PROMPT`, `RETRY_FIX_PROMPT`) are module-level strings, not buried logic, so they diff cleanly in PRs. The Fixer Docker image installs all supported runtimes (JDK 17 + Maven, Node 20 + npm, Python 3.11 + pip); the Watcher image remains lightweight. The Knowledge Agent and Classifier have no images of their own — their source is copied into the Fixer's image and both run in-process, imported directly by `agents/fixer/main.py`.  
     
 - **`agents/watcher/`** — the only component that polls CI and decides whether to retry. `retry_gate.py` contains zero model calls, zero file edits, and zero git operations. It checks the retry bound, creates a `RETRY_REQUESTED` tracking record with the CI failure excerpt, and invokes the Fixer container. It never invokes the Fixer if the bound is reached. `main.py` imports no git library; the Watcher container image does not need the `git` binary installed.  
     
 - **`streamlit_dashboard.py`** — a read-only, local-only Streamlit app (OBS-01). Connects to the tracking store (Cosmos if `COSMOS_ENDPOINT` is set, InMemory otherwise), and renders three views: run history table, retry lineage drill-down by PR, and POC success metrics (resolution rate, avg/p50/p95 time-to-resolution, token usage). No hosting story required for the POC; any team member runs it on their own laptop with `az login` and an appropriate Cosmos RBAC assignment.  
     
-- **`scripts/bootstrap_foundry_project.sh`** — run **once**. Deploys Bicep, captures outputs (ACR login server, Key Vault URI, Cosmos endpoint) to `.env.infra`, and prints the manual RBAC grant commands including the Cosmos DB Built-in Data Contributor role for each agent managed identity.  
+- **`scripts/bootstrap_foundry_project.sh`** — run **once**. Deploys Bicep, captures outputs (ACR login server, Key Vault URI, Cosmos endpoint) directly into `config.yaml`'s `infra:` section (requires `cp config.yaml.example config.yaml` first — the script errors out otherwise), and prints the manual RBAC grant commands including the Cosmos DB Built-in Data Contributor role for each agent managed identity.  
     
 - **`scripts/update_agent.py`** — run **every time** a change is shipped. Builds and pushes container images (tagged with git SHA), then calls the Foundry SDK to create-or-update each Hosted Agent definition. The Fixer image build must verify that `mvn --version` succeeds as a build-time smoke test so a missing Maven installation fails the build, not runtime.  
     
@@ -619,7 +620,7 @@ where `manifest_file` is the framework's dependency manifest (`pom.xml`, `packag
 
 ## 5\. What the AAF-Access Person Must Do
 
-We hand them a repo. They need to do a small number of things that **require their access** and cannot be done or tested by us:
+We hand them a repo. They need to do a small number of things that **require their access** and cannot be done or tested by us. This section is the summary; **DEPLOYMENT_AAF.md** in this repo is the full step-by-step walkthrough (exact commands, a complete configuration reference table, and the known gaps in `update_agent.py`'s current Foundry SDK call) — follow that document directly rather than this section alone.
 
 1. **Confirm/create the Foundry project** — needs subscription-level Owner/Contributor or Account Owner role. We are not creating the Foundry account/project in Bicep — only referencing an existing one. Provisioning a brand-new Foundry account is a one-time portal/CLI action on their side.  
      
@@ -641,16 +642,17 @@ az cosmosdb sql role assignment create \
   --scope "/"
 ```
 
-4. **Populate Key Vault secrets:** the customer's GitHub PAT and Nexus IQ API key. We provision the empty Key Vault with RBAC authorization enabled; they put the actual secret values in. The Cosmos DB endpoint is passed as a plain env var (not a secret) — it is not sensitive.  
+4. **Populate Key Vault secrets:** the customer's GitHub PAT, Nexus IQ API key, and an Anthropic API key. We provision the empty Key Vault with RBAC authorization enabled; they put the actual secret values in. The Anthropic API key is easy to miss since it isn't an Azure-native credential — it's required because `code_fixer.py` and the inline Knowledge Agent call `anthropic.Anthropic()`, which reads it directly, separately from the Foundry model deployment in step 2. The Cosmos DB endpoint is passed as a plain env var (not a secret) — it is not sensitive.  
      
-5. **Run our two scripts, in order:**  
+5. **Set up config, then run our two scripts, in order:**  
      
-   - `bootstrap_foundry_project.sh` — once. Deploys Bicep, outputs `.env.infra`.  
+   - `cp config.yaml.example config.yaml`, then fill in the values as they become available (see DEPLOYMENT_AAF.md sections 1–3).  
+   - `bootstrap_foundry_project.sh` — once. Deploys Bicep, writes outputs directly into `config.yaml`'s `infra:` section.  
    - `update_agent.py` — every time there is a change to ship.
 
    
 
-6. **Run the manual smoke test** (checklist in README) — trigger the Fixer agent once against a test repo, confirm a PR gets created with a tracking record and a passing `mvn compile` gate visible in the container logs, confirm the Watcher reacts to a deliberately broken CI run, confirm the retry bound stops after `MAX_RETRY_ATTEMPTS`.
+6. **Run the manual smoke test** (checklist in README, and DEPLOYMENT_AAF.md section 9) — trigger the Fixer agent once against a test repo, confirm a PR gets created with a tracking record and a passing compile/build gate visible in the container logs (`build (maven): SUCCESS`, or the equivalent for whichever framework the test repo uses — section 4.7), confirm the Watcher reacts to a deliberately broken CI run, confirm the retry bound stops after `MAX_RETRY_ATTEMPTS`.
 
 Everything else — orchestration logic, Nexus parsing, retry/guardrail logic, tracking store, container builds — is built, tested (with mocks), and reviewed entirely on our side first.
 

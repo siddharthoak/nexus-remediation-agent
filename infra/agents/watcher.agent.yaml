@@ -17,6 +17,12 @@ trigger:
   schedule: "{{WATCHER_SCHEDULE}}"
 
 environment:
+  # Pins the tracking/KB store backend selection explicitly rather than relying
+  # on the "unset" fallback (Cosmos if COSMOS_ENDPOINT happens to be set) —
+  # see PLAN.md section 4.4a.
+  - name: DEPLOYMENT_MODE
+    value: "azure"
+
   - name: GITHUB_REPO_TARGET
     value: "{{GITHUB_REPO_TARGET}}"
 

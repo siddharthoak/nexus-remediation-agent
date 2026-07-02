@@ -47,6 +47,7 @@ runtime:
 secrets:
   nexus_iq_api_key: "nexus-iq-api-key"
   github_pat: "github-pat"
+  anthropic_api_key: "anthropic-api-key"
 
 # ── Infrastructure ────────────────────────────────────────────────────────────
 # Populated automatically by scripts/bootstrap_foundry_project.sh.

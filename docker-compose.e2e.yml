@@ -1,0 +1,30 @@
+# Full-pipeline local testing: Fixer (Knowledge Agent + Classifier run in-process
+# inside it — see agents/fixer/main.py) and Watcher, built from this repo and
+# invoked as one-shot jobs sharing a single .env file.
+#
+# Neither service is a long-running server, so use `run --rm <service>`, not `up`.
+# The `manual` profile keeps a bare `docker compose up` / `podman compose up` from
+# starting either job by accident.
+#
+# Works identically with `docker compose -f docker-compose.e2e.yml ...` and
+# `podman compose -f docker-compose.e2e.yml ...` — see TESTING_DOCKER.md section 6
+# or TESTING_PODMAN.md section 6 for the full walkthrough.
+
+services:
+  fixer:
+    build:
+      context: .
+      dockerfile: agents/fixer/Dockerfile
+    image: nexus-remediation-fixer-local
+    env_file: .env
+    volumes:
+      - ./scan-reports:/reports
+    profiles: ["manual"]
+
+  watcher:
+    build:
+      context: .
+      dockerfile: agents/watcher/Dockerfile
+    image: nexus-remediation-watcher-local
+    env_file: .env
+    profiles: ["manual"]

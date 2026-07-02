@@ -27,6 +27,8 @@ COPY agents/fixer/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agents/common/ /app/common/
+COPY agents/knowledge_agent/ /app/knowledge_agent/
+COPY agents/classifier/ /app/classifier/
 COPY agents/fixer/ /app/
 
 CMD ["python", "main.py"]
