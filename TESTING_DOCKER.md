@@ -295,12 +295,12 @@ code path production uses, just reached from your laptop instead of a Hosted Age
 
 **If you don't have a Cosmos account handy**, skip this section — section 5 already
 gives you a genuine (if single-container) exercise of the Fixer's full pipeline
-(Knowledge Agent, Classifier, CodeFixer, PR creation). The Watcher's own decision
-logic (retry-bound checks, escalation, pattern learning) is separately covered by
-`pytest tests/test_retry_controller.py tests/test_code_fixer.py -v`, which calls
-`RetryGate`/`CodeFixer.run_retry_fix()` directly with fakes — no live container
-hand-off required. That test suite is, today, the only way to see a *successful*
-automatic retry exercised — see 6.3–6.4 for why.
+(Knowledge Agent, Classifier, CodeFixer, PR creation). `CodeFixer.run_retry_fix()`
+itself is separately covered by `pytest tests/test_code_fixer.py -v`, which calls
+it directly with fakes — no live container hand-off required. `RetryGate` (the
+Watcher's actual retry-bound/escalation logic) does **not** have dedicated test
+coverage today — see the callout in 6.4. Sections 6.1–6.3 below are, today, the
+only way to see a *successful* automatic retry exercised.
 
 ### 6.1 Set up
 
@@ -390,16 +390,30 @@ of the Watcher's logic except the final hand-off. For the hand-off itself, and f
 
 ```bash
 pip install -r requirements.txt
-pytest tests/test_retry_controller.py tests/test_code_fixer.py -v
+pytest tests/test_code_fixer.py -v
 ```
 
-These tests call `RetryGate.process_ci_failure()` and `CodeFixer.run_retry_fix()`
-directly with mocked collaborators, so they exercise the full state machine —
-including a CI failure that *does* get a successful retry, and a retry that
-exhausts `MAX_RETRY_ATTEMPTS` and escalates — without needing one live process to
-invoke another live process. Treat this suite as the source of truth for retry
-logic; treat 6.1–6.3 as the source of truth for "does this actually build and run
-as containers, with real Cosmos and GitHub, end to end."
+`CodeFixer.run_retry_fix()` is covered here with mocked collaborators, exercising
+the full retry-fix state machine without needing one live process to invoke
+another. Treat 6.1–6.3 as the source of truth for "does this actually build and
+run as containers, with real Cosmos and GitHub, end to end."
+
+> **Known gap — `retry_gate.py` (`RetryGate`), the module actually imported by
+> `agents/watcher/main.py` and described throughout PLAN.md section 4.5/4.6, has
+> no dedicated unit test file today.** `tests/test_retry_controller.py` — despite
+> the name's similarity — tests `agents/watcher/retry_controller.py`
+> (`RetryController`/`attempt_fix()`/`InMemoryAttemptCounter`), an earlier design
+> that is **not imported by any production code** (`agents/watcher/main.py` imports
+> `RetryGate` from `retry_gate.py` instead) and that calls Claude directly to
+> diagnose CI failures — a responsibility the current architecture deliberately
+> keeps out of the Watcher (PLAN.md section 3: "`retry_gate.py` contains zero model
+> calls, zero file edits, and zero git operations"). Running
+> `pytest tests/test_retry_controller.py -v` still passes and is harmless, but it
+> is not exercising the live retry path — don't mistake a green run there for
+> coverage of `RetryGate`. Sections 6.1–6.3 above are, today, the closest thing to
+> real test coverage `RetryGate.process_ci_failure()` has; adding a
+> `tests/test_retry_gate.py` that mocks `TrackingStore`/`make_fixer_invoker()` the
+> way this file mocks its collaborators would close the gap.
 
 ### 6.5 Inspect what happened
 

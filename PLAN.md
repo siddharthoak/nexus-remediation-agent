@@ -92,9 +92,10 @@ nexus-remediation-agent/
 ├── tests/
 │   ├── test_nexus_client.py
 │   ├── test_scan_report_client.py   ← Trivy/Grype/OWASP JSON parsing + merge-by-component logic
-│   ├── test_code_fixer.py
+│   ├── test_code_fixer.py           ← includes CodeFixer.run_retry_fix() coverage
 │   ├── test_frameworks.py           ← BuildFramework detection priority + per-framework bump/build/test
-│   └── test_retry_gate.py
+│   └── test_retry_controller.py     ← tests agents/watcher/retry_controller.py, an unused legacy
+│                                       module — NOT the active retry_gate.py/RetryGate (see below)
 └── .github/workflows/
     └── ci.yml
 ```
@@ -130,7 +131,7 @@ nexus-remediation-agent/
     
 - **`scripts/update_agent.py`** — run **every time** a change is shipped. Builds and pushes container images (tagged with git SHA), then calls the Foundry SDK to create-or-update each Hosted Agent definition. The Fixer image build must verify that `mvn --version` succeeds as a build-time smoke test so a missing Maven installation fails the build, not runtime.  
     
-- **`tests/`** — unit tests for everything testable without AAF access. Each test module has isolated fixtures so a schema change in `TrackingRecord` requires updating exactly one place. Test names describe safety properties rather than method names (e.g. `test_fixer_refuses_when_status_is_not_retry_requested`, `test_apply_file_change_returns_error_not_silent_skip_when_find_string_absent`, `test_compile_failure_surfaces_stderr_not_exception`).  
+- **`tests/`** — unit tests for everything testable without AAF access. Each test module has isolated fixtures so a schema change in `TrackingRecord` requires updating exactly one place. Test names describe safety properties rather than method names (e.g. `test_fixer_refuses_when_status_is_not_retry_requested`, `test_apply_file_change_returns_error_not_silent_skip_when_find_string_absent`, `test_compile_failure_surfaces_stderr_not_exception`). **Known gap:** `test_retry_controller.py` tests `agents/watcher/retry_controller.py` (`RetryController`/`attempt_fix()`), an earlier retry design that predates the Fixer/Watcher split and is no longer imported by any production code — `agents/watcher/main.py` imports `RetryGate` from `retry_gate.py` instead (section 4.5/4.6). `retry_gate.py` has no dedicated test file of its own today; TESTING_DOCKER.md section 6.4 has the full detail.  
     
 - **`.github/workflows/ci.yml`** — CI for this repo (lint \+ test our orchestration code), separate from the customer's own CI pipeline that the Fixer agent's PRs will trigger.
 
