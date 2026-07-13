@@ -1,0 +1,95 @@
+// OSS Vulnerability Remediation — standalone KQL queries.
+//
+// These are the same queries embedded in remediation-workbook.json, provided
+// standalone so they can be pasted directly into Application Insights' Logs
+// blade or a manually-created Workbook if the Bicep-deployed Workbook resource
+// (Microsoft.Insights/workbooks in main.bicep) doesn't render as expected —
+// unlike the Nexus IQ API contract or the AAF SDK's create_agent signature,
+// this Workbook JSON schema has NOT been verified against a live Azure deploy;
+// treat it the same way as those other flagged gaps (PLAN.md section 6,
+// DEPLOYMENT_AAF.md section 5's known-gap callout).
+//
+// All queries read the `traces` table, populated by agents/common/telemetry.py.
+// Requires DEPLOYMENT_MODE=azure with APPLICATIONINSIGHTS_CONNECTION_STRING set
+// (see DEPLOYMENT_AAF.md section 3.6) — empty results usually just mean no fix
+// attempts have run yet, or the time range picker needs widening.
+
+// ── Run history: every fix attempt, with token cost ────────────────────────
+traces
+| where message == "FixAttemptCompleted"
+| extend repo = tostring(customDimensions.repo),
+         component = tostring(customDimensions.component_name),
+         old_version = tostring(customDimensions.old_version),
+         new_version = tostring(customDimensions.new_version),
+         mode = tostring(customDimensions.mode),
+         cve_ids = tostring(customDimensions.cve_ids),
+         framework = tostring(customDimensions.framework_detected),
+         unit_test_status = tostring(customDimensions.unit_test_status),
+         prompt_tokens = toint(customDimensions.prompt_tokens),
+         completion_tokens = toint(customDimensions.completion_tokens),
+         total_tokens = toint(customDimensions.total_tokens),
+         attempt_number = toint(customDimensions.attempt_number)
+| project timestamp, repo, component, old_version, new_version, mode, attempt_number,
+          cve_ids, framework, unit_test_status, prompt_tokens, completion_tokens, total_tokens
+| order by timestamp desc;
+
+// ── Retry lineage / resolutions / escalations ──────────────────────────────
+traces
+| where message in ("FixResolved", "FixEscalated", "FixRetryRequested")
+| extend repo = tostring(customDimensions.repo),
+         component = tostring(customDimensions.component_name),
+         pr_number = tostring(customDimensions.pr_number),
+         attempt_number = toint(customDimensions.attempt_number),
+         reason = tostring(customDimensions.reason),
+         resolution_hours = round(todouble(customDimensions.time_to_resolution_seconds) / 3600, 2),
+         outcome = message
+| project timestamp, outcome, repo, component, pr_number, attempt_number, reason, resolution_hours
+| order by timestamp desc;
+
+// ── Retry lineage for one specific PR ───────────────────────────────────────
+// Fill in @pr_number, then run — mirrors the Streamlit dashboard's "Retry Lineage" tab.
+traces
+| where message in ("FixAttemptCompleted", "FixResolved", "FixEscalated", "FixRetryRequested")
+| extend pr_number = tostring(customDimensions.pr_number)
+| where pr_number == tostring(@pr_number)
+| order by timestamp asc;
+
+// ── Token usage by CVE / component (bar chart) ──────────────────────────────
+traces
+| where message == "FixAttemptCompleted"
+| extend component = tostring(customDimensions.component_name), total_tokens = toint(customDimensions.total_tokens)
+| summarize TotalTokens = sum(total_tokens), FixAttempts = count() by component
+| order by TotalTokens desc
+| take 20;
+
+// ── Token usage over time (time chart) ──────────────────────────────────────
+traces
+| where message == "FixAttemptCompleted"
+| extend total_tokens = toint(customDimensions.total_tokens)
+| summarize TotalTokens = sum(total_tokens), FixAttempts = count() by bin(timestamp, 1d)
+| order by timestamp asc;
+
+// ── Fresh-scan vs. retry token cost ──────────────────────────────────────────
+// Retries should generally cost less per attempt (informed by failure_log_excerpt,
+// narrower scope) — this validates that assumption over time.
+traces
+| where message == "FixAttemptCompleted"
+| extend total_tokens = toint(customDimensions.total_tokens), mode = tostring(customDimensions.mode)
+| summarize FixAttempts = count(), TotalTokens = sum(total_tokens), AvgTokensPerAttempt = round(avg(total_tokens), 0) by mode
+| order by mode asc;
+
+// ── Resolution rate over time ────────────────────────────────────────────────
+traces
+| where message in ("FixResolved", "FixEscalated")
+| summarize Count = count() by bin(timestamp, 1d), Outcome = message
+| order by timestamp asc;
+
+// ── Findings the agent never attempted to fix (Bucket 1 / Bucket 4 triage) ──
+traces
+| where message == "FixSkipped"
+| extend repo = tostring(customDimensions.repo),
+         component = tostring(customDimensions.component_name),
+         cve_ids = tostring(customDimensions.cve_ids),
+         bucket = toint(customDimensions.bucket)
+| project timestamp, repo, component, cve_ids, bucket
+| order by timestamp desc;

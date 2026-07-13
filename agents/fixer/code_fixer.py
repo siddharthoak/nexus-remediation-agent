@@ -34,6 +34,7 @@ from typing import Optional
 import anthropic
 
 from common.tracking_store import TrackingStatus
+from common.telemetry import emit_event
 from frameworks import detect_framework
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class ChangeSummary:
     completion_tokens: int = 0
     framework_detected: Optional[str] = None
     unit_test_status: Optional[str] = None  # "SUCCESS" | "NO_TESTS_FOUND" | "SOFT_FAIL" | None
+    kb_hit: bool = False  # True if stored KB patterns were applied with no model call
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
@@ -193,7 +195,7 @@ changes required to upgrade a specific dependency from one version to another.
 - Component: {component_name}
 - Current version: {current_version}
 - Target version: {target_version}
-
+{kb_context}
 ## Repository file tree (paths only)
 {file_listing}
 
@@ -248,7 +250,7 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 ```
 {failure_log_excerpt}
 ```
-
+{kb_context}
 ## Repository file tree (paths only)
 {file_listing}
 
@@ -284,6 +286,37 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 """
 
 
+def _build_kb_context(kb_entry) -> str:
+    """
+    Render a KnowledgeEntry (Tier 1 learned / Tier 2 playbook / Knowledge Agent) as a
+    prompt section. Returns "" if kb_entry is None so the prompt templates' {kb_context}
+    placeholder collapses to a blank line rather than leaving a stray heading.
+    """
+    if kb_entry is None:
+        return ""
+
+    lines = [f"\n## Knowledge base context (source: {kb_entry.source}, confidence: {kb_entry.confidence})"]
+    if kb_entry.breaking_changes:
+        lines.append("Known breaking changes:")
+        lines += [f"- {c}" for c in kb_entry.breaking_changes]
+    if kb_entry.api_removals:
+        lines.append("Removed/renamed APIs:")
+        lines += [f"- {a}" for a in kb_entry.api_removals]
+    if kb_entry.migration_steps:
+        lines.append("Suggested migration steps:")
+        lines += [f"{i}. {s}" for i, s in enumerate(kb_entry.migration_steps, 1)]
+    if kb_entry.patterns:
+        lines.append(
+            "Previously seen fix patterns for this exact upgrade (already attempted "
+            "automatically before this loop started — verify against read_file output "
+            "before reapplying, since they may not match this repo's exact content):"
+        )
+        for p in kb_entry.patterns:
+            lines.append(f"- find: {p.get('find', '')!r} -> replace: {p.get('replace', '')!r}"
+                         f" ({p.get('description', '')})")
+    return "\n".join(lines) + "\n"
+
+
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 class CodeFixerError(Exception):
@@ -312,7 +345,12 @@ class CodeFixer:
     'find' strings exact matches rather than training-knowledge guesses.
     """
 
-    def __init__(self, repo_path: str, model_deployment_name: Optional[str] = None):
+    def __init__(
+        self,
+        repo_path: str,
+        model_deployment_name: Optional[str] = None,
+        kb_store=None,
+    ):
         self._repo_path = Path(repo_path)
         self._model = model_deployment_name or os.environ["MODEL_DEPLOYMENT_NAME"]
         self._client = anthropic.Anthropic()
@@ -320,6 +358,7 @@ class CodeFixer:
         self._applied_changes: list[str] = []  # paths written by apply_file_change during the loop
         self._framework = detect_framework(self._repo_path)  # None in degraded mode
         self._last_test_status: Optional[str] = None  # last run_unit_tests() result this loop
+        self._kb_store = kb_store  # optional KnowledgeStoreProtocol; None disables the KB-hit fast path
 
     # ── Public entry points ───────────────────────────────────────────────────
 
@@ -359,7 +398,25 @@ class CodeFixer:
         }
         record.framework_detected = summary.framework_detected
         record.unit_test_status = summary.unit_test_status
+        record.kb_hit = summary.kb_hit
         tracking_store.update(record)
+        emit_event(
+            "FixAttemptCompleted",
+            mode="fresh",
+            tracking_id=tracking_id,
+            repo=record.repo,
+            component_name=component_name,
+            old_version=current_version,
+            new_version=target_version,
+            cve_ids=cve_ids,
+            attempt_number=record.attempt_number,
+            framework_detected=summary.framework_detected,
+            unit_test_status=summary.unit_test_status,
+            kb_hit=summary.kb_hit,
+            prompt_tokens=summary.prompt_tokens,
+            completion_tokens=summary.completion_tokens,
+            total_tokens=summary.prompt_tokens + summary.completion_tokens,
+        )
         return summary
 
     def run_retry_fix(
@@ -426,7 +483,26 @@ class CodeFixer:
         }
         record.framework_detected = summary.framework_detected
         record.unit_test_status = summary.unit_test_status
+        record.kb_hit = summary.kb_hit
         tracking_store.update(record)
+        emit_event(
+            "FixAttemptCompleted",
+            mode="retry",
+            tracking_id=tracking_id,
+            repo=record.repo,
+            component_name=record.component_name,
+            old_version=record.old_version,
+            new_version=record.new_version,
+            cve_ids=[record.vulnerability_id] if record.vulnerability_id else [],
+            pr_number=record.pr_number,
+            attempt_number=record.attempt_number,
+            framework_detected=summary.framework_detected,
+            unit_test_status=summary.unit_test_status,
+            kb_hit=summary.kb_hit,
+            prompt_tokens=summary.prompt_tokens,
+            completion_tokens=summary.completion_tokens,
+            total_tokens=summary.prompt_tokens + summary.completion_tokens,
+        )
         return summary
 
     # ── Core fix logic (shared by both entry points) ──────────────────────────
@@ -453,10 +529,50 @@ class CodeFixer:
                 self._repo_path,
             )
 
-        # Step 2: Run the tool-use loop — Claude inspects files, applies changes, verifies build.
-        # Changes are written to disk during the loop via apply_file_change tool calls.
+        # Step 2: Check the Knowledge Store for a KB-hit fast path before any model call.
+        # Only Tier 1 (learned) / Tier 2 (playbook) / Knowledge Agent entries with concrete
+        # find/replace patterns are eligible — an entry with only prose (breaking_changes,
+        # migration_steps) can't be mechanically applied and falls through to the model,
+        # which still receives it as grounding context (see _call_model's kb_context).
         self._applied_changes = []
         self._last_test_status = None
+        kb_entry = None
+        if self._kb_store is not None:
+            kb_entry = self._kb_store.find_applicable(component_name, current_version, target_version)
+
+        kb_hit = False
+        if kb_entry and kb_entry.patterns and self._framework is not None:
+            kb_hit = self._try_kb_patterns(kb_entry)
+
+        if kb_hit:
+            manifest_files = [self._framework.manifest_file] if self._framework else []
+            files_changed = manifest_files + list(dict.fromkeys(self._applied_changes))
+            unit_test_status = (
+                self._last_test_status if self._last_test_status in ("SUCCESS", "NO_TESTS_FOUND") else None
+            )
+            return ChangeSummary(
+                component_name=component_name,
+                old_version=current_version,
+                new_version=target_version,
+                files_changed=files_changed,
+                rationale=(
+                    f"Applied {len(kb_entry.patterns)} stored fix pattern(s) from the Knowledge Base "
+                    f"({kb_entry.source}, confidence={kb_entry.confidence}) directly — no model call "
+                    "was required. Build and unit test gates both passed."
+                ),
+                cve_ids=cve_ids,
+                prompt_tokens=0,
+                completion_tokens=0,
+                framework_detected=self._framework.name if self._framework else None,
+                unit_test_status=unit_test_status,
+                kb_hit=True,
+            )
+
+        # Step 3: Fall back to the tool-use loop — Claude inspects files, applies changes,
+        # verifies build. If a KB-hit attempt was made above and failed (build/test failure,
+        # patterns didn't match this repo's content), any changes it already wrote to disk
+        # remain — Claude sees them via read_file and self-corrects rather than starting blind.
+        # kb_entry (if present) is injected into the prompt as grounded context either way.
         file_listing = self._build_file_listing()
         reasoning, prompt_tokens, completion_tokens = self._call_model(
             component_name=component_name,
@@ -464,6 +580,7 @@ class CodeFixer:
             target_version=target_version,
             file_listing=file_listing,
             failure_log_excerpt=failure_log_excerpt,
+            kb_entry=kb_entry,
         )
 
         # Deduplicate paths while preserving order — a file may have been corrected more than once.
@@ -488,7 +605,95 @@ class CodeFixer:
             completion_tokens=completion_tokens,
             framework_detected=self._framework.name if self._framework else None,
             unit_test_status=unit_test_status,
+            kb_hit=False,
         )
+
+    # ── KB-hit fast path (Tier 1 / Tier 2 / Knowledge Agent patterns, no model call) ──
+
+    def _try_kb_patterns(self, kb_entry) -> bool:
+        """
+        Attempt to apply every stored find/replace pattern in kb_entry mechanically,
+        then run the same build + unit-test gates the model-driven loop would run.
+        Returns True only if at least one pattern matched this repo AND both gates
+        passed (or NO_TESTS_FOUND) — the caller treats that as a full KB hit and
+        skips the Claude call entirely. Returns False otherwise (including "no
+        pattern matched anything"), in which case any changes already written to
+        disk are left in place for the model loop to inspect and correct.
+        """
+        applied_total = 0
+        for pattern in kb_entry.patterns:
+            find_str = pattern.get("find", "")
+            replace_str = pattern.get("replace", "")
+            if not find_str:
+                continue
+            applied_total += self._apply_pattern_repo_wide(find_str, replace_str)
+
+        if applied_total == 0:
+            logger.info(
+                "KB entry (%s) for %s found, but none of its %d pattern(s) matched this "
+                "repo's content — falling back to the model.",
+                kb_entry.source, kb_entry.component_name, len(kb_entry.patterns),
+            )
+            return False
+
+        build_result = self._framework.build(self._repo_path)
+        if not build_result.success:
+            logger.info(
+                "KB-hit pattern application for %s failed to build — falling back to the "
+                "model with KB context injected.",
+                kb_entry.component_name,
+            )
+            return False
+
+        test_result = self._framework.test_unit(self._repo_path)
+        self._last_test_status = test_result.status
+        if test_result.status not in ("SUCCESS", "NO_TESTS_FOUND"):
+            logger.info(
+                "KB-hit pattern application for %s built cleanly but unit tests failed — "
+                "falling back to the model with KB context injected.",
+                kb_entry.component_name,
+            )
+            return False
+
+        logger.info(
+            "KB hit (%s): %d pattern(s) applied across %d file(s) for %s — build and unit "
+            "tests both passed, no model call required.",
+            kb_entry.source, len(kb_entry.patterns), applied_total, kb_entry.component_name,
+        )
+        return True
+
+    def _apply_pattern_repo_wide(self, find_str: str, replace_str: str) -> int:
+        """
+        Apply a single find->replace pattern across every source file in the repo that
+        contains find_str verbatim. Unlike apply_file_change (used by the model loop,
+        which targets one file and replaces only the first occurrence for precision),
+        a stored KB pattern has no associated file path — it was learned from a
+        previous repo's diff — so it must be matched by content, and every occurrence
+        in a matching file is replaced since the pattern was vetted as safe/deterministic
+        at learning time (see PatternLearner's extraction prompt).
+        Returns the number of files modified.
+        """
+        exts = {
+            ".java", ".kt", ".groovy", ".xml", ".properties", ".yml", ".yaml",
+            ".ts", ".tsx", ".js", ".jsx", ".json", ".py",
+        }
+        excluded_dirs = {"target", "build", "node_modules", ".venv", "venv", ".git"}
+        modified = 0
+        for f in sorted(self._repo_path.rglob("*")):
+            if excluded_dirs & set(f.parts) or f.suffix not in exts:
+                continue
+            try:
+                content = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if find_str not in content:
+                continue
+            f.write_text(content.replace(find_str, replace_str), encoding="utf-8")
+            rel = str(f.relative_to(self._repo_path))
+            self._applied_changes.append(rel)
+            modified += 1
+            logger.info("KB pattern applied to %s", rel)
+        return modified
 
     # ── Model call (agentic tool-use loop) ────────────────────────────────────
 
@@ -499,6 +704,7 @@ class CodeFixer:
         target_version: str,
         file_listing: str,
         failure_log_excerpt: Optional[str],
+        kb_entry=None,
     ) -> tuple:
         """
         Agentic tool-use loop. Claude calls read_file / grep_files to inspect real
@@ -507,10 +713,15 @@ class CodeFixer:
 
         Token counts are accumulated across all rounds so the tracking record
         reflects the true cost of the entire conversation, not just the last turn.
+
+        kb_entry, if present, anchors Claude to retrieved/learned ground truth (Knowledge
+        Agent web research, a Tier 2 playbook, or a prior Tier 1 confirmed fix) rather than
+        parametric training knowledge, which may be stale for recently published versions.
         """
         framework_name = self._framework.name if self._framework else (
             "none detected — no compile/test gate available; CI is the fallback verification"
         )
+        kb_context = _build_kb_context(kb_entry)
 
         if failure_log_excerpt:
             prompt = RETRY_FIX_PROMPT.format(
@@ -520,6 +731,7 @@ class CodeFixer:
                 target_version=target_version,
                 failure_log_excerpt=failure_log_excerpt[:6000],
                 file_listing=file_listing,
+                kb_context=kb_context,
             )
         else:
             prompt = FRESH_FIX_PROMPT.format(
@@ -528,6 +740,7 @@ class CodeFixer:
                 current_version=current_version,
                 target_version=target_version,
                 file_listing=file_listing,
+                kb_context=kb_context,
             )
 
         messages = [{"role": "user", "content": prompt}]

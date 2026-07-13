@@ -155,6 +155,71 @@ resource cosmosRetryContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabase
   }
 }
 
+// ── Log Analytics Workspace + Application Insights (OBS-02) ───────────────────
+// Backs the AAF-deployment-only Azure Monitor telemetry emitted by
+// agents/common/telemetry.py (DEPLOYMENT_MODE=azure only — local testing never
+// touches this; see PLAN.md section 4.9). Additive to Cosmos DB above, not a
+// replacement for it — Cosmos remains the Fixer/Watcher's shared source of truth
+// for retry-bound enforcement; this is purely an observability/analytics layer.
+//
+// PerGB2018 (pay-as-you-go): first 5 GB/month ingestion is free per workspace,
+// then roughly $2.30-2.76/GB depending on region; 30-day retention is set
+// explicitly below (within the free retention window) to keep this at or near
+// $0/month for a POC's fix-attempt volume.
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
+  name: '${projectPrefix}-logs-${take(suffix, 6)}'
+  location: location
+  tags: commonTags
+  properties: {
+    sku: {
+      name: 'PerGB2018'
+    }
+    retentionInDays: 30
+  }
+}
+
+// Workspace-based Application Insights (the only supported mode today — "classic"
+// App Insights is deprecated). agents/common/telemetry.py talks to this via its
+// connection string, using azure-monitor-opentelemetry's OpenTelemetry distro —
+// no instrumentation key / classic SDK involved.
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: '${projectPrefix}-appins-${take(suffix, 6)}'
+  location: location
+  tags: commonTags
+  kind: 'other'
+  properties: {
+    Application_Type: 'other'
+    WorkspaceResourceId: logAnalyticsWorkspace.id
+    IngestionMode: 'LogAnalytics'
+  }
+}
+
+// Azure Monitor Workbook — pre-built dashboard (run history, retry lineage, token
+// usage by CVE / over time, resolution rate) reading the traces this project emits.
+// NOTE: this Workbook JSON schema (infra/observability/remediation-workbook.json)
+// has not been verified against a live Azure deployment — same caveat class as the
+// Nexus IQ API contract and AAF SDK call in scripts/update_agent.py (PLAN.md
+// section 6). infra/observability/queries.kql has the identical queries as a
+// guaranteed-usable fallback (paste into Logs or a manually created Workbook) if
+// this resource doesn't render as expected.
+resource remediationWorkbook 'Microsoft.Insights/workbooks@2022-04-01' = {
+  name: guid(resourceGroup().id, 'oss-remediation-workbook')
+  location: location
+  tags: commonTags
+  kind: 'shared'
+  properties: {
+    displayName: 'OSS Remediation — AI Usage & Fix History'
+    serializedData: replace(
+      loadTextContent('observability/remediation-workbook.json'),
+      '__APPINSIGHTS_RESOURCE_ID__',
+      appInsights.id
+    )
+    version: '1.0'
+    sourceId: appInsights.id
+    category: 'workbook'
+  }
+}
+
 // ── Outputs (consumed by scripts/bootstrap_foundry_project.sh and update_agent.py) ──
 output acrLoginServer string = acr.properties.loginServer
 output keyVaultUri string = keyVault.properties.vaultUri
@@ -164,3 +229,6 @@ output cosmosEndpoint string = cosmosAccount.properties.documentEndpoint
 output cosmosDatabaseName string = cosmosDatabase.name
 output cosmosTrackingContainerName string = cosmosTrackingContainer.name
 output cosmosKBContainerName string = cosmosKBContainer.name
+output logAnalyticsWorkspaceName string = logAnalyticsWorkspace.name
+output appInsightsName string = appInsights.name
+output appInsightsConnectionString string = appInsights.properties.ConnectionString

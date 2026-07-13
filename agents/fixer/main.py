@@ -50,6 +50,7 @@ from common.tracking_store import (
     TrackingStatus,
 )
 from common.knowledge_store import make_knowledge_store
+from common.telemetry import init_telemetry, emit_event, shutdown_telemetry
 from knowledge_agent.main import KnowledgeAgent
 from classifier.rules import Classifier
 
@@ -64,6 +65,8 @@ MAX_PARALLEL_FIXES = int(os.environ.get("MAX_PARALLEL_FIXES", "5"))
 
 
 def main():
+    init_telemetry(role_name="fixer")
+
     retry_tracking_id = os.environ.get("RETRY_TRACKING_ID")
 
     if retry_tracking_id:
@@ -134,6 +137,28 @@ def _run_fresh_scan():
                 rationale=result.rationale,
                 kb_entry=result.kb_entry,
             )
+            # Bucket 1/4: no fix attempted — write a terminal SKIPPED record so the
+            # dashboard/audit trail covers every finding, not just the ones fixed.
+            skip_record = make_fresh_record(
+                vulnerability_id=finding.cve_ids[0] if finding.cve_ids else finding.component_name,
+                repo=github_repo,
+                component_name=finding.component_name,
+                old_version=finding.current_version,
+                new_version=finding.recommended_version,
+            )
+            skip_record.status = TrackingStatus.SKIPPED.value
+            skip_record.bucket = result.bucket
+            skip_record.skip_reason = result.rationale
+            tracking_store.create(skip_record)
+            emit_event(
+                "FixSkipped",
+                repo=github_repo,
+                component_name=finding.component_name,
+                old_version=finding.current_version,
+                new_version=finding.recommended_version,
+                cve_ids=finding.cve_ids,
+                bucket=result.bucket,
+            )
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Clone once — all parallel workers copy from this local source ─────────
@@ -160,13 +185,14 @@ def _run_fresh_scan():
             new_version=finding.recommended_version,
         )
         record.branch_name = branch_name
+        record.bucket = result.bucket
         tracking_store.create(record)
-        tasks.append((finding, branch_name, record, result.kb_entry))
+        tasks.append((finding, branch_name, record))
 
     # ── Fix each vulnerability in parallel ────────────────────────────────────
 
     def _fix_one(task):
-        finding, branch_name, record, kb_entry = task
+        finding, branch_name, record = task
         logger.info("Processing %s → branch %s", finding.component_name, branch_name)
 
         with RepoOps() as repo:
@@ -181,7 +207,12 @@ def _run_fresh_scan():
                 )
                 return None
 
-            fixer = CodeFixer(repo_path=repo._local_path)
+            # kb_store here lets the Fixer check the Knowledge Store itself, independent
+            # of the Classifier's own (bucketing-only) KB lookup — matches the flow
+            # described in PLAN.md section 4 ("Check Knowledge Store ... KB hit ... apply
+            # stored find/replace pairs ... if FAILURE fall back to Claude loop with KB
+            # injected"). CodeFixer resolves the KB entry internally in _execute_fix().
+            fixer = CodeFixer(repo_path=repo._local_path, kb_store=kb_store)
             try:
                 summary = fixer.run_fresh_fix(
                     component_name=finding.component_name,
@@ -190,7 +221,6 @@ def _run_fresh_scan():
                     tracking_id=record.tracking_id,
                     tracking_store=tracking_store,
                     cve_ids=finding.cve_ids,
-                    kb_entry=kb_entry,
                 )
             except Exception as exc:
                 logger.error("Fix failed for %s: %s", finding.component_name, exc)
@@ -261,6 +291,7 @@ def _run_retry(tracking_id: str):
     github_pat      = os.environ["GITHUB_PAT"]
 
     tracking_store = make_tracking_store()
+    kb_store       = make_knowledge_store()
 
     record = tracking_store.get(tracking_id)
     if record is None:
@@ -279,7 +310,7 @@ def _run_retry(tracking_id: str):
         # Check out the EXISTING PR branch — never create a new one
         repo._repo.git.checkout(record.branch_name)
 
-        fixer = CodeFixer(repo_path=repo._local_path)
+        fixer = CodeFixer(repo_path=repo._local_path, kb_store=kb_store)
         try:
             summary = fixer.run_retry_fix(
                 tracking_id=tracking_id,
@@ -308,4 +339,11 @@ def _run_retry(tracking_id: str):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Flush any buffered Azure Monitor telemetry before this one-shot
+        # process exits — see common/telemetry.py's shutdown_telemetry()
+        # docstring for why this can't just rely on atexit. No-op if
+        # telemetry was never enabled.
+        shutdown_telemetry()

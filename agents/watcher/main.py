@@ -20,6 +20,7 @@ The Watcher NEVER:
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 
 from github import Github
 from ci_status import CIStatusWatcher, CIOutcome
@@ -29,6 +30,7 @@ from pattern_learner import PatternLearner
 
 from common.tracking_store import make_tracking_store, TrackingStatus
 from common.knowledge_store import make_knowledge_store
+from common.telemetry import init_telemetry, emit_event, shutdown_telemetry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +48,15 @@ _TERMINAL_STATUSES = {
 }
 
 
+def _elapsed_seconds_since(iso_timestamp: str) -> "float | None":
+    """Best-effort elapsed time since an ISO 8601 timestamp; None if unparseable."""
+    try:
+        created_dt = datetime.fromisoformat(iso_timestamp)
+        return (datetime.now(timezone.utc) - created_dt).total_seconds()
+    except Exception:
+        return None
+
+
 def find_open_remediation_prs(repo):
     """Return open PRs whose head branch starts with the remediation prefix."""
     pulls = repo.get_pulls(state="open")
@@ -53,6 +64,8 @@ def find_open_remediation_prs(repo):
 
 
 def main():
+    init_telemetry(role_name="watcher")
+
     github_repo = os.environ["GITHUB_REPO_TARGET"]
     github_pat = os.environ["GITHUB_PAT"]
 
@@ -114,6 +127,18 @@ def _process_pr(pr, tracking_store, ci_watcher, retry_gate, kb_store, pattern_le
         logger.info("PR #%d: CI passed. Marking resolved.", pr_number)
         record.status = TrackingStatus.CI_PASSED.value
         tracking_store.update(record)
+        emit_event(
+            "FixResolved",
+            tracking_id=record.tracking_id,
+            repo=record.repo,
+            component_name=record.component_name,
+            old_version=record.old_version,
+            new_version=record.new_version,
+            vulnerability_id=record.vulnerability_id,
+            pr_number=pr_number,
+            attempt_number=record.attempt_number,
+            time_to_resolution_seconds=_elapsed_seconds_since(record.created_at),
+        )
         # Tier 1: learn fix patterns from this confirmed-good PR
         try:
             pattern_learner.learn_from_pr(pr_number, record, kb_store)
@@ -136,4 +161,7 @@ def _process_pr(pr, tracking_store, ci_watcher, retry_gate, kb_store, pattern_le
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        shutdown_telemetry()

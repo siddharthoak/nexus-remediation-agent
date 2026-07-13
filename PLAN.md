@@ -38,7 +38,11 @@ nexus-remediation-agent/
 ├── requirements.txt
 ├── streamlit_dashboard.py              ← OBS-01: observability dashboard (co-branded Neurealm × Premier)
 ├── infra/
-│   ├── main.bicep                      ← ACR, Key Vault, Cosmos DB (Serverless)
+│   ├── main.bicep                      ← ACR, Key Vault, Cosmos DB (Serverless),
+│   │                                      Log Analytics + App Insights + Workbook (OBS-02)
+│   ├── observability/
+│   │   ├── remediation-workbook.json   ← Azure Monitor Workbook definition (deployed by main.bicep)
+│   │   └── queries.kql                 ← same KQL standalone — fallback if the Workbook doesn't render
 │   └── agents/
 │       ├── fixer.agent.yaml
 │       └── watcher.agent.yaml
@@ -49,7 +53,9 @@ nexus-remediation-agent/
 │   ├── common/                         ← shared package, all containers copy this
 │   │   ├── __init__.py
 │   │   ├── tracking_store.py           ← INF-03: persistent tracking record store (Cosmos + InMemory)
-│   │   └── knowledge_store.py          ← KB read/write abstraction (CosmosKBStore + InMemoryKBStore)
+│   │   ├── knowledge_store.py          ← KB read/write abstraction (CosmosKBStore + InMemoryKBStore)
+│   │   └── telemetry.py                ← OBS-02: Azure Monitor telemetry; no-op unless
+│   │                                      APPLICATIONINSIGHTS_CONNECTION_STRING is set (AAF only)
 │   ├── discovery/                      ← [DEFERRED — post-POC; see Section 3 note below]
 │   │   ├── Dockerfile                  ← lightweight; no Maven, no git
 │   │   ├── main.py                     ← reads Nexus report; applies ignore/known lists; creates Issues for filtered findings; outputs actionable list
@@ -102,11 +108,13 @@ nexus-remediation-agent/
 
 ### Why this split
 
-- **`infra/main.bicep`** — declares the Azure resources that must exist before any agent can run: ACR (container images), Key Vault (GitHub PAT \+ Nexus IQ key \+ Anthropic API key), and Cosmos DB Serverless account with the `oss-remediation` database and `tracking-records` container (90-day TTL, partition key `/id`). Does not provision the Foundry project itself — only references an existing one.  
+- **`infra/main.bicep`** — declares the Azure resources that must exist before any agent can run: ACR (container images), Key Vault (GitHub PAT \+ Nexus IQ key \+ Anthropic API key), a Cosmos DB Serverless account with the `oss-remediation` database and `tracking-records` container (90-day TTL, partition key `/id`), and — as of Section 4.9 (OBS-02) — a Log Analytics workspace, workspace-based Application Insights, and an Azure Monitor Workbook. Does not provision the Foundry project itself — only references an existing one.  
     
-- **`infra/agents/*.agent.yaml`** — Hosted Agent definition files (name, container image reference, cron schedule, env vars, Key Vault secret references, identity scopes). Both agent yaml files set `DEPLOYMENT_MODE=azure` directly (a fixed constant, not templated from config — see section 4.4a) to pin the store/vulnerability-source backend selection explicitly rather than relying on the "unset" fallback. The Watcher yaml adds `COSMOS_ENDPOINT`, `COSMOS_DATABASE`, `COSMOS_CONTAINER`, and `MAX_RETRY_ATTEMPTS`; the Fixer yaml adds `NEXUS_IQ_APP_PUBLIC_ID`, `GITHUB_REPO_TARGET`, `MODEL_DEPLOYMENT_NAME`, and an `ANTHROPIC_API_KEY` Key Vault `secretRef` — required because `code_fixer.py` and the inline Knowledge Agent both call `anthropic.Anthropic()`, which reads that env var directly regardless of `MODEL_DEPLOYMENT_NAME` naming a Foundry-hosted deployment.  
+- **`infra/observability/`** — `remediation-workbook.json` (the Azure Monitor Workbook `main.bicep` deploys automatically) and `queries.kql` (the identical KQL as standalone text, for pasting into Logs or a manually created Workbook if the deployed one doesn't render — see Section 4.9's caveat that this JSON schema is unverified against a live Azure deployment, same class of gap as the items in Section 6).  
     
-- **`agents/common/`** — a shared Python package copied into all container images at build time (see Dockerfiles). No agent has a runtime dependency on another's container. Contains the tracking store abstraction (all agents read/write) and the knowledge store abstraction (Classifier, Knowledge Init, and Fixer read/write KB entries).  
+- **`infra/agents/*.agent.yaml`** — Hosted Agent definition files (name, container image reference, cron schedule, env vars, Key Vault secret references, identity scopes). Both agent yaml files set `DEPLOYMENT_MODE=azure` directly (a fixed constant, not templated from config — see section 4.4a) to pin the store/vulnerability-source backend selection explicitly rather than relying on the "unset" fallback. The Watcher yaml adds `COSMOS_ENDPOINT`, `COSMOS_DATABASE`, `COSMOS_CONTAINER`, `MAX_RETRY_ATTEMPTS`, and `APPLICATIONINSIGHTS_CONNECTION_STRING`; the Fixer yaml adds `NEXUS_IQ_APP_PUBLIC_ID`, `GITHUB_REPO_TARGET`, `MODEL_DEPLOYMENT_NAME`, the same `APPLICATIONINSIGHTS_CONNECTION_STRING`, and an `ANTHROPIC_API_KEY` Key Vault `secretRef` — required because `code_fixer.py` and the inline Knowledge Agent both call `anthropic.Anthropic()`, which reads that env var directly regardless of `MODEL_DEPLOYMENT_NAME` naming a Foundry-hosted deployment. `APPLICATIONINSIGHTS_CONNECTION_STRING` is a plain value, not a `secretRef` — same convention as `COSMOS_ENDPOINT` (PLAN.md section 5, item 4): it only grants write access to telemetry ingestion, not read access to any data.  
+    
+- **`agents/common/`** — a shared Python package copied into all container images at build time (see Dockerfiles). No agent has a runtime dependency on another's container. Contains the tracking store abstraction (all agents read/write), the knowledge store abstraction (Classifier, Knowledge Init, and Fixer read/write KB entries), and the telemetry abstraction (Section 4.9 — Fixer and Watcher both emit through it; local testing never touches it).  
     
   - **`tracking_store.py`** — single source of truth for all fix attempt state. Contains `TrackingRecord` dataclass, `TrackingStatus` enum, `CosmosTrackingStore` (production) and `InMemoryTrackingStore` (testing) backends, and the `make_fresh_record` / `make_retry_record` factory functions. The `make_retry_record` function is called exclusively by the Watcher; it sets `status=RETRY_REQUESTED` and stores `failure_log_excerpt` before the Fixer is invoked.
 
@@ -619,6 +627,36 @@ where `manifest_file` is the framework's dependency manifest (`pom.xml`, `packag
 
 ---
 
+## 4.9. Observability — Azure Monitor Telemetry (OBS-02)
+
+**Deployment split:** Azure Monitor telemetry is **AAF-deployment-only**. Local testing (`DEPLOYMENT_MODE=local`, or any Docker/Podman run per TESTING_DOCKER.md/TESTING_PODMAN.md) continues to use the read-only Streamlit dashboard (Section 7) against Cosmos or InMemory stores — nothing about local testing changes. `agents/common/telemetry.py` only activates when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set, which only happens in the deployed agent YAML files.
+
+**Why Azure Monitor over Grafana/Power BI/hosting Streamlit:** Azure Monitor Workbooks are free — the only cost is Log Analytics ingestion (first 5 GB/month free per workspace, then roughly $2.30–2.76/GB depending on region), which at this project's fix-attempt volume should stay at or near $0/month. This is materially cheaper than Azure Managed Grafana (per-tier/user cost) or Power BI (Pro license required to share, ~$10/user/month), and needs no compute host of its own — unlike Streamlit today, which has no real deployed-hosting story (Section 7 still describes it as something a team member runs on their own laptop).
+
+**What's provisioned (`infra/main.bicep`):**
+- A **Log Analytics workspace** (`PerGB2018`, 30-day retention — within the free retention window).
+- A **workspace-based Application Insights** component (classic App Insights is deprecated; this is the only supported mode).
+- An **Azure Monitor Workbook** (`Microsoft.Insights/workbooks`), deployed automatically from `infra/observability/remediation-workbook.json`, bound to the App Insights resource via `sourceId`. Panels: run history (every `FixAttemptCompleted` event), retry lineage / resolutions / escalations, token usage by CVE/component, token usage over time, fresh-scan vs. retry token cost, and resolved-vs-escalated counts over time.
+- **This Workbook JSON schema has not been verified against a live Azure deployment** — the same caveat class as the Nexus IQ API contract (Section 6) and the AAF SDK call in `scripts/update_agent.py` (Section 5). `infra/observability/queries.kql` has the identical KQL as a guaranteed-usable fallback (paste into Logs, or a manually created Workbook) if the Bicep-deployed one doesn't render as expected.
+
+**What's instrumented (`agents/common/telemetry.py`):** a thin wrapper around the `azure-monitor-opentelemetry` distro. `init_telemetry(role_name)` is called once near the top of each agent's `main()`; `emit_event(event_name, **fields)` logs a structured event (captured by Azure Monitor's logging auto-instrumentation and exported to Application Insights' `traces` table, with every keyword argument landing in `customDimensions`); `shutdown_telemetry()` flushes the exporter's batch queue before process exit — necessary because the Fixer and Watcher are one-shot scripts, not long-running servers, so an unflushed batch on exit would silently drop the last events. Five events are emitted across the pipeline:
+
+| Event | Where | What it captures |
+| :---- | :---- | :---- |
+| `FixAttemptCompleted` | `code_fixer.py`, both `run_fresh_fix()` and `run_retry_fix()` | component, CVE(s), old/new version, framework, unit-test status, prompt/completion/total tokens, attempt number, fresh vs. retry — the primary source for "token usage by CVE fix" |
+| `FixSkipped` | `fixer/main.py`, at Bucket 1/4 triage-issue creation | component, CVE(s), bucket, repo — findings the agent never attempted, for a complete picture alongside what it did fix |
+| `FixResolved` | `watcher/main.py`, at CI_PASSED | component, PR number, attempt number, time-to-resolution (computed the same way `retry_gate.py`'s `_handle_limit_reached` already did for `FAILED_MAX_RETRIES`, just not persisted to the tracking record) |
+| `FixRetryRequested` | `retry_gate.py`, after a successful Fixer invocation | PR number, attempt number, parent tracking id — retry-depth visibility over time |
+| `FixEscalated` | `retry_gate.py`, both `_handle_limit_reached()` and the Fixer-invocation-failure path | PR number, attempt number, reason (`max_retries_reached` vs. `fixer_invocation_failed`), time-to-resolution |
+
+**Fail-safe behavior (hard requirement):** nothing in `telemetry.py` may ever raise into a caller. If `APPLICATIONINSIGHTS_CONNECTION_STRING` is unset, `init_telemetry()` logs one informational line and returns `False` — this is the expected, non-error state for local testing. If it's set but initialization fails for any reason (malformed connection string, DNS/network failure, package import error), the failure is caught, logged as an **error** (so an ops dashboard watching container logs would flag the outage), and telemetry is disabled for the rest of that process — the fix/watch run continues exactly as it would have with no telemetry configured at all. `emit_event()` and `shutdown_telemetry()` follow the same pattern. Verified locally: both the "unset" and "malformed connection string" paths return cleanly with no exception propagating.
+
+**Complementary, code-free platform metrics:** independent of any of the above, enabling diagnostic settings on the Azure AI Foundry model deployment itself (routed to the same Log Analytics workspace) surfaces Azure AI Foundry's own built-in token/request/latency metrics at the platform level, with zero code changes — see DEPLOYMENT_AAF.md section 3.6. This is a useful cross-check against the per-CVE `FixAttemptCompleted` totals, though it can't attribute tokens back to a specific CVE the way the custom events can.
+
+**Known gap surfaced while wiring this up:** `agents/fixer/main.py`'s `_fix_one()` was calling `fixer.run_fresh_fix(..., kb_entry=kb_entry)`, but `CodeFixer.run_fresh_fix()` has no `kb_entry` parameter — this would have raised `TypeError` on every single fresh-scan fix attempt in production, silently blocking both remediation and this new telemetry from ever running. Fixed by removing the invalid argument. This also confirms that the "KB-hit path (direct tool apply, no LLM) + tool-use loop fallback" described for `code_fixer.py` earlier in this document (Section 3, Section 4's end-to-end flow diagram) is **not actually implemented** — `code_fixer.py` has no `kb_entry`-handling logic at all today; every fix, including Bucket 3 (major-with-known-migration), runs the full tool-use loop with no KB context injected. Implementing that fast path is a separate, larger piece of work than this observability pass — tracked here rather than silently left inconsistent with the rest of this document.
+
+---
+
 ## 5\. What the AAF-Access Person Must Do
 
 We hand them a repo. They need to do a small number of things that **require their access** and cannot be done or tested by us. This section is the summary; **DEPLOYMENT_AAF.md** in this repo is the full step-by-step walkthrough (exact commands, a complete configuration reference table, and the known gaps in `update_agent.py`'s current Foundry SDK call) — follow that document directly rather than this section alone.
@@ -673,6 +711,8 @@ target repo without waiting on that.
 ---
 
 ## 7\. Observability & Visibility (POC)
+
+**Scope note:** this section (OBS-01, Streamlit) is the **local/dev** observability story. As of Section 4.9 (OBS-02), an **AAF deployment** gets Azure Monitor Workbooks instead — native, lower-cost, no compute host to run, and it adds token-usage-by-CVE and over-time views this dashboard doesn't have. The two are not redundant: this dashboard still runs fine against a real Cosmos account (`DEPLOYMENT_MODE=azure` locally, per TESTING_DOCKER.md/TESTING_PODMAN.md section 6.5) for quick ad hoc debugging, but is not part of the AAF deployment itself.
 
 ### Decision
 

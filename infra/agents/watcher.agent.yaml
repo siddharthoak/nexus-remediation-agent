@@ -53,6 +53,11 @@ environment:
   - name: PROJECT_ENDPOINT
     value: "{{PROJECT_ENDPOINT}}"
 
+  # OBS-02: Azure Monitor telemetry (agents/common/telemetry.py) — see the same
+  # note in fixer.agent.yaml. Not a secret; disables itself safely if unset.
+  - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+    value: "{{APPLICATIONINSIGHTS_CONNECTION_STRING}}"
+
   # Secrets — referenced from Key Vault, never hardcoded.
   # TODO: Confirm Key Vault reference syntax against current AAF Hosted Agent docs.
   - name: GITHUB_PAT

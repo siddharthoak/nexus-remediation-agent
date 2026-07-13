@@ -9,6 +9,13 @@ Everything in Steps 1–4 runs with **no external credentials** (no Anthropic ke
 GitHub PAT, no Nexus IQ key, no Azure/Cosmos). Step 5 is optional and requires real
 credentials for a true end-to-end run.
 
+**Observability note (OBS-02):** Azure Monitor telemetry (`agents/common/telemetry.py`)
+is AAF-deployment-only — see DEPLOYMENT_AAF.md section 3.6 / PLAN.md section 4.9.
+Nothing in this guide sets `APPLICATIONINSIGHTS_CONNECTION_STRING`, so it stays
+unset throughout, and `telemetry.py` no-ops silently the whole way through — you
+don't need to do anything differently because of it. The Streamlit dashboard
+(Section 6.5) remains the observability tool for everything in this guide.
+
 ---
 
 ## 0. Prerequisites
@@ -262,6 +269,15 @@ With no `COSMOS_ENDPOINT` set, `make_tracking_store()` / `make_knowledge_store()
 back to `InMemoryTrackingStore` / `InMemoryKBStore` automatically — state just won't
 persist past the container's lifetime, which is fine for a one-off local smoke test.
 
+**If you tried this section before and every finding failed with
+`TypeError: run_fresh_fix() got an unexpected keyword argument 'kb_entry'`:**
+that was a real bug in `agents/fixer/main.py`'s `_fix_one()` (a stray `kb_entry=`
+argument `CodeFixer.run_fresh_fix()` never accepted), not a problem with your
+setup — it's fixed now. It also means the "KB-hit path (direct tool apply, no
+LLM)" this doc's sibling files describe for `code_fixer.py` isn't actually
+implemented yet (PLAN.md section 4.9) — every fix here runs the full Claude
+tool-use loop regardless of bucket.
+
 ---
 
 ## 6. Full end-to-end: Watcher + Fixer + Knowledge Agent + Classifier together
@@ -429,6 +445,12 @@ The **Run History** tab shows the tracking records you just created (including t
 `ESCALATED` one), **Retry Lineage** shows the parent→child chain via
 `parent_tracking_id`, and **Knowledge Base** shows whatever the Knowledge Agent
 hydrated during the Fixer's fresh scan.
+
+This Streamlit dashboard is the observability tool for local testing — it stays
+that way regardless of OBS-02. An actual AAF deployment additionally gets an
+Azure Monitor Workbook with token-usage-by-CVE and over-time views this dashboard
+doesn't have (DEPLOYMENT_AAF.md section 3.6, PLAN.md section 4.9), but that's not
+something exercised by anything in this file.
 
 ---
 

@@ -91,8 +91,19 @@ Bicep deployments are idempotent. It:
      one document per fix attempt), `kb-entries` (no TTL — Knowledge Base
      entries across all three tiers), and `retry-attempts` (legacy attempt
      counter, superseded by `count_attempts_for_pr()`).
+   - A **Log Analytics workspace** and **workspace-based Application
+     Insights** component (OBS-02) — backs the Azure Monitor telemetry
+     described in Section 3.6 and PLAN.md section 4.9. No manual step
+     required for these two; see Section 3.6 for what's automatic vs. not.
+   - An **Azure Monitor Workbook**, deployed from
+     `infra/observability/remediation-workbook.json` — a pre-built dashboard
+     reading that telemetry. Best-effort: this Workbook JSON schema has not
+     been verified against a live Azure deployment (Section 12). If it
+     doesn't render, `infra/observability/queries.kql` has the same queries
+     to paste manually.
 4. Writes the deployment outputs (ACR login server, Key Vault URI, Cosmos
-   endpoint, etc.) directly into `config.yaml`'s `infra:` section.
+   endpoint, App Insights connection string, etc.) directly into
+   `config.yaml`'s `infra:` section.
 5. Prints the manual steps below — keep that output visible for Section 3.
 
 Expected output ends with `Infrastructure deployed.` followed by the four
@@ -192,6 +203,45 @@ nexus:
 The `schedules:`, `runtime:`, and `secrets:` sections already have working
 defaults in `config.yaml.example` — adjust only if you need different values
 (e.g. a tighter `max_retry_attempts`, or a different cron cadence).
+
+### 3.6 Observability (OBS-02) — mostly automatic
+
+Unlike everything else in this section, **no manual portal step is required**
+for the core telemetry setup — Section 2's bootstrap run already provisioned
+the Log Analytics workspace, Application Insights, and the Workbook, and
+wrote `infra.app_insights_connection_string` into `config.yaml`.
+`scripts/update_agent.py` (Section 5) wires that value into both agents as
+`APPLICATIONINSIGHTS_CONNECTION_STRING` automatically — nothing further to
+configure to get the Fixer/Watcher emitting telemetry.
+
+What you get without any extra step: an Azure Monitor Workbook ("OSS
+Remediation — AI Usage & Fix History") in the resource group, with run
+history, retry lineage/resolutions/escalations, token usage by CVE/component,
+token usage over time, and resolved-vs-escalated trend panels. Find it under
+the resource group's **Workbooks** blade, or under the Application Insights
+resource's own **Workbooks** tab. If a panel renders empty, widen the time
+range picker (top right) — it defaults to the last 30 days, and won't show
+anything until the Fixer/Watcher have actually run at least once.
+
+**Optional, still manual — platform-level token/request metrics at zero
+code:** Azure AI Foundry model deployments emit their own token/request/
+latency metrics to Azure Monitor if diagnostic settings are enabled on the
+Foundry project resource. This can't be automated by our Bicep (the Foundry
+project isn't a resource we provision — Section 3.1). To enable it: in the
+Foundry project's **Diagnostic settings** blade, add a setting sending logs
+and metrics to the Log Analytics workspace named in your bootstrap output
+(`infra.log_analytics_workspace_name` in `config.yaml`). This gives a second,
+code-free cross-check against the custom `FixAttemptCompleted` token totals —
+useful for confirming the two roughly agree, though only the custom events
+can attribute tokens back to a specific CVE/component.
+
+**If telemetry isn't provisioned or is misconfigured, nothing breaks.**
+`agents/common/telemetry.py` is designed so a missing or invalid
+`APPLICATIONINSIGHTS_CONNECTION_STRING` degrades to "telemetry disabled,
+logged once" — the Fixer and Watcher run exactly as they would with no
+telemetry configured at all. Check the container logs for
+`Azure Monitor telemetry failed to initialize` (an `ERROR`-level line) if you
+expect telemetry to be active and the Workbook stays empty.
 
 ---
 
@@ -351,6 +401,9 @@ but unblocks testing the rest of the pipeline against a real target repo.
 | `infra.acr_login_server` | — (image reference prefix) | update script | Yes | Auto-filled by bootstrap script |
 | `infra.key_vault_uri` | — (`keyVaultUri` in each `secretRef`) | update script | Yes | Auto-filled by bootstrap script |
 | `infra.cosmos_endpoint` | `COSMOS_ENDPOINT` | Fixer, Watcher | Yes | Auto-filled by bootstrap script |
+| `infra.app_insights_connection_string` | `APPLICATIONINSIGHTS_CONNECTION_STRING` | Fixer, Watcher | No (OBS-02) | Auto-filled by bootstrap script (Section 3.6); plain value, not a `secretRef` (same convention as `cosmos_endpoint`) — a missing/blank value disables telemetry safely, it never blocks a fix run |
+| `infra.log_analytics_workspace_name` | — (used to find the Workbook / configure Foundry diagnostic settings) | you, manually | No | Auto-filled by bootstrap script; see Section 3.6's optional platform-metrics step |
+| `infra.app_insights_name` | — (informational) | you, manually | No | Auto-filled by bootstrap script |
 | — (hardcoded in agent YAML, not `config.yaml`) | `DEPLOYMENT_MODE=azure` | Fixer, Watcher | Yes | See above — added in this pass |
 
 ---
@@ -380,10 +433,23 @@ a **disposable test repo** (never a production repo for this first run):
       an escalation comment, writing `FAILED_MAX_RETRIES`.
 - [ ] Confirm no force-pushes and no duplicate PRs across repeated Fixer
       runs against the same open PR.
+- [ ] (OBS-02) Confirm telemetry is flowing: open the Azure Monitor Workbook
+      (Section 3.6) and check the "fix attempts (run history)" panel shows
+      the run you just triggered, with non-zero token counts. If it's empty,
+      check the Fixer/Watcher container logs for
+      `Azure Monitor telemetry initialized` (confirms it's active) vs.
+      `Azure Monitor telemetry failed to initialize` (confirms it's disabled
+      and why — the fix itself should still have succeeded either way).
 
 ---
 
-## 10. Observability — pointing the dashboard at the deployed environment
+## 10. Optional: Streamlit against the deployed Cosmos account
+
+The Azure Monitor Workbook (Section 3.6) is the AAF deployment's actual
+observability surface — this section is a secondary, ad hoc option for
+pointing the local Streamlit dashboard (OBS-01, PLAN.md section 7) at the
+same live Cosmos data, useful for quick debugging without opening the Azure
+portal.
 
 ```bash
 python3 -m pip install streamlit pandas
@@ -434,3 +500,15 @@ of them block completing this guide, but all affect production-readiness:
   flow through the Knowledge Agent and Classifier unfiltered; this doesn't
   block deployment, it just means no pre-filtering of accepted-risk findings
   yet.
+- **The Azure Monitor Workbook JSON (`infra/observability/remediation-workbook.json`)
+  is unverified against a live Azure deployment** (Section 3.6, PLAN.md
+  section 4.9) — same class of gap as the two items above it. The KQL itself
+  (`infra/observability/queries.kql`) is lower-risk since it's plain text to
+  paste in, not a schema that has to deploy correctly as an ARM resource.
+- **The KB-hit fast path described for `code_fixer.py` earlier in this
+  repo's design docs is not actually implemented** (PLAN.md section 4.9) —
+  every fix, including Bucket 3 (major-with-known-migration), runs the full
+  Claude tool-use loop today; no KB context is injected into the prompt.
+  Discovered and partially fixed (a crash-causing stray `kb_entry` keyword
+  argument) while wiring up OBS-02 telemetry, since that crash would have
+  silently prevented the new telemetry from ever firing on fresh scans.

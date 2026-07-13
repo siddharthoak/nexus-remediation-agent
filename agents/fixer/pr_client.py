@@ -154,11 +154,18 @@ class PRClient:
         }
         test_line = status_lines.get(test_status, "Unit test status was not recorded.")
 
+        kb_hit_line = ""
+        if getattr(change_summary, "kb_hit", False):
+            kb_hit_line = (
+                "\n**Knowledge Base:** this fix was applied directly from stored KB patterns "
+                "— no model call was needed."
+            )
+
         return f"""
 ### Verification
 
 **Build framework:** `{framework}`
-**Unit tests:** {test_line}
+**Unit tests:** {test_line}{kb_hit_line}
 """
 
     def add_comment(self, pr_number: int, comment: str) -> None:

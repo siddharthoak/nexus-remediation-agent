@@ -90,6 +90,13 @@ def build_substitutions(cfg: dict, image_tag: str) -> dict:
         "ACR_LOGIN_SERVER":          env_or("ACR_LOGIN_SERVER",        cfg["infra"]["acr_login_server"]),
         "KEY_VAULT_URI":             env_or("KEY_VAULT_URI",           cfg["infra"]["key_vault_uri"]),
         "COSMOS_ENDPOINT":           env_or("COSMOS_ENDPOINT",         cfg["infra"]["cosmos_endpoint"]),
+        # .get() with a default here (unlike the other infra.* keys above): a
+        # config.yaml written before OBS-02 was added won't have this key yet,
+        # and telemetry.py already treats a blank value as "disabled" safely.
+        "APPLICATIONINSIGHTS_CONNECTION_STRING": env_or(
+            "APPLICATIONINSIGHTS_CONNECTION_STRING",
+            cfg["infra"].get("app_insights_connection_string", ""),
+        ),
 
         # Azure AI Foundry
         "PROJECT_ENDPOINT":          env_or("PROJECT_ENDPOINT",        cfg["foundry"]["project_endpoint"]),

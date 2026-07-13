@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "fixe
 
 from code_fixer import CodeFixer, CodeFixerError
 from frameworks.maven import PomXMLError
+from common.knowledge_store import KnowledgeEntry
 
 
 SAMPLE_POM_XML = """\
@@ -90,12 +91,26 @@ def _tool_use_response(tool_name: str, tool_input: dict, tool_use_id: str = "too
     return msg
 
 
-def _make_fixer(repo_dir: str, responses: list) -> CodeFixer:
+def _make_fixer(repo_dir: str, responses: list, kb_store=None) -> CodeFixer:
     """Build a CodeFixer whose model call returns each of `responses` in sequence."""
-    fixer = CodeFixer(repo_path=repo_dir, model_deployment_name="test-model")
+    fixer = CodeFixer(repo_path=repo_dir, model_deployment_name="test-model", kb_store=kb_store)
     fixer._client = MagicMock()
     fixer._client.messages.create.side_effect = responses
     return fixer
+
+
+def _kb_entry(patterns: list, source="tier1_learned", confidence="high") -> KnowledgeEntry:
+    return KnowledgeEntry(
+        entry_id="test-entry",
+        component_name="org.example:log4j",
+        from_version="1.2.17",
+        to_version="2.20.0",
+        from_major=1,
+        to_major=2,
+        source=source,
+        patterns=patterns,
+        confidence=confidence,
+    )
 
 
 def _run(fixer, current_version="1.2.17", target_version="2.20.0"):
@@ -337,3 +352,73 @@ class TestApplyFileChangeErrorSurfacesToClaude:
         fixer = _make_fixer(repo_dir, responses)
         with pytest.raises(CodeFixerError):
             _run(fixer)
+
+
+class TestKBHitFastPath:
+    """KB-hit fast path (Tier 1/2/knowledge_agent patterns applied with no model call)."""
+
+    def test_matching_pattern_applied_with_no_model_call(self, repo_dir):
+        kb_store = MagicMock()
+        kb_store.find_applicable.return_value = _kb_entry([
+            {
+                "find": "import org.apache.log4j.Logger;",
+                "replace": "import org.apache.logging.log4j.LogManager;",
+                "description": "log4j 1.x to 2.x Logger import change",
+            }
+        ])
+        # No responses queued — a model call would raise StopIteration and fail the test.
+        fixer = _make_fixer(repo_dir, [], kb_store=kb_store)
+
+        # Mock the actual build/test gates — org.example:log4j is a fictional artifact
+        # that a real `mvn compile` could never resolve; only the pattern-application
+        # and gate-sequencing logic is under test here.
+        with patch.object(fixer._framework, "build", return_value=MagicMock(success=True)), \
+             patch.object(fixer._framework, "test_unit", return_value=MagicMock(status="NO_TESTS_FOUND")):
+            summary = _run(fixer)
+
+        assert summary.kb_hit is True
+        assert summary.prompt_tokens == 0
+        assert summary.completion_tokens == 0
+        content = (Path(repo_dir) / "src/main/java/com/example/App.java").read_text()
+        assert "LogManager" in content
+        assert any("App.java" in f for f in summary.files_changed)
+
+    def test_no_matching_pattern_falls_back_to_model(self, repo_dir):
+        kb_store = MagicMock()
+        kb_store.find_applicable.return_value = _kb_entry([
+            {"find": "this string is not in any file", "replace": "x", "description": "n/a"}
+        ])
+        fixer = _make_fixer(repo_dir, [_end_turn_response(RATIONALE_NO_CHANGES)], kb_store=kb_store)
+
+        summary = _run(fixer)
+
+        assert summary.kb_hit is False
+        assert summary.prompt_tokens > 0
+
+    def test_pattern_matches_but_build_fails_falls_back_to_model_with_kb_context(self, repo_dir):
+        kb_store = MagicMock()
+        kb_store.find_applicable.return_value = _kb_entry([
+            {
+                "find": "import org.apache.log4j.Logger;",
+                "replace": "import org.apache.logging.log4j.LogManager;",
+                "description": "log4j 1.x to 2.x Logger import change",
+            }
+        ])
+        fixer = _make_fixer(repo_dir, [_end_turn_response(RATIONALE_NO_CHANGES)], kb_store=kb_store)
+
+        with patch.object(fixer._framework, "build") as mock_build:
+            mock_build.return_value = MagicMock(success=False, output="compile error")
+            summary = _run(fixer)
+
+        assert summary.kb_hit is False
+        # The pattern's edit was already applied to disk before the build gate ran.
+        content = (Path(repo_dir) / "src/main/java/com/example/App.java").read_text()
+        assert "LogManager" in content
+        # The model call received the KB entry as context.
+        sent_prompt = fixer._client.messages.create.call_args_list[0].kwargs["messages"][0]["content"]
+        assert "Knowledge base context" in sent_prompt
+
+    def test_no_kb_store_configured_skips_fast_path(self, repo_dir):
+        fixer = _make_fixer(repo_dir, [_end_turn_response(RATIONALE_NO_CHANGES)], kb_store=None)
+        summary = _run(fixer)
+        assert summary.kb_hit is False

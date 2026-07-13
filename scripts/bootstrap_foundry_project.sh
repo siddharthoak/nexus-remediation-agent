@@ -111,16 +111,22 @@ KEY_VAULT_URI=$(echo "${DEPLOYMENT_OUTPUT}"    | python3 -c "import sys,json; pr
 ACR_NAME=$(echo "${DEPLOYMENT_OUTPUT}"         | python3 -c "import sys,json; print(json.load(sys.stdin)['acrName']['value'])")
 KEY_VAULT_NAME=$(echo "${DEPLOYMENT_OUTPUT}"   | python3 -c "import sys,json; print(json.load(sys.stdin)['keyVaultName']['value'])")
 COSMOS_ENDPOINT=$(echo "${DEPLOYMENT_OUTPUT}"  | python3 -c "import sys,json; print(json.load(sys.stdin)['cosmosEndpoint']['value'])")
+LOG_ANALYTICS_WORKSPACE_NAME=$(echo "${DEPLOYMENT_OUTPUT}" | python3 -c "import sys,json; print(json.load(sys.stdin)['logAnalyticsWorkspaceName']['value'])")
+APP_INSIGHTS_NAME=$(echo "${DEPLOYMENT_OUTPUT}" | python3 -c "import sys,json; print(json.load(sys.stdin)['appInsightsName']['value'])")
+APP_INSIGHTS_CONNECTION_STRING=$(echo "${DEPLOYMENT_OUTPUT}" | python3 -c "import sys,json; print(json.load(sys.stdin)['appInsightsConnectionString']['value'])")
 
 echo "================================================================"
 echo "  Infrastructure deployed."
 echo "================================================================"
 echo ""
-echo "  ACR_LOGIN_SERVER = ${ACR_LOGIN_SERVER}"
-echo "  KEY_VAULT_URI    = ${KEY_VAULT_URI}"
-echo "  ACR_NAME         = ${ACR_NAME}"
-echo "  KEY_VAULT_NAME   = ${KEY_VAULT_NAME}"
-echo "  COSMOS_ENDPOINT  = ${COSMOS_ENDPOINT}"
+echo "  ACR_LOGIN_SERVER              = ${ACR_LOGIN_SERVER}"
+echo "  KEY_VAULT_URI                 = ${KEY_VAULT_URI}"
+echo "  ACR_NAME                      = ${ACR_NAME}"
+echo "  KEY_VAULT_NAME                = ${KEY_VAULT_NAME}"
+echo "  COSMOS_ENDPOINT               = ${COSMOS_ENDPOINT}"
+echo "  LOG_ANALYTICS_WORKSPACE_NAME  = ${LOG_ANALYTICS_WORKSPACE_NAME}"
+echo "  APP_INSIGHTS_NAME             = ${APP_INSIGHTS_NAME}"
+echo "  APP_INSIGHTS_CONNECTION_STRING = (written to config.yaml — not printed; see note in step 3 below)"
 echo ""
 
 # ── Step 5: Write infra outputs into config.yaml ─────────────────────────────
@@ -133,12 +139,15 @@ with open('${CONFIG_FILE}', 'r') as f:
 
 # Targeted line-by-line replacement to preserve comments and key order.
 replacements = {
-    'acr_login_server':    '${ACR_LOGIN_SERVER}',
-    'acr_name':            '${ACR_NAME}',
-    'key_vault_uri':       '${KEY_VAULT_URI}',
-    'key_vault_name':      '${KEY_VAULT_NAME}',
-    'cosmos_endpoint':     '${COSMOS_ENDPOINT}',
-    'azure_resource_group':'${RESOURCE_GROUP}',
+    'acr_login_server':              '${ACR_LOGIN_SERVER}',
+    'acr_name':                      '${ACR_NAME}',
+    'key_vault_uri':                 '${KEY_VAULT_URI}',
+    'key_vault_name':                '${KEY_VAULT_NAME}',
+    'cosmos_endpoint':                '${COSMOS_ENDPOINT}',
+    'azure_resource_group':          '${RESOURCE_GROUP}',
+    'log_analytics_workspace_name':  '${LOG_ANALYTICS_WORKSPACE_NAME}',
+    'app_insights_name':             '${APP_INSIGHTS_NAME}',
+    'app_insights_connection_string': '${APP_INSIGHTS_CONNECTION_STRING}',
 }
 
 lines = content.splitlines()
@@ -205,5 +214,18 @@ echo "      NOTE: This is the DATA PLANE role (not ARM Contributor)."
 echo ""
 echo "  5. THEN RUN:"
 echo "     python3 scripts/update_agent.py"
+echo ""
+echo "  NOTE — OBSERVABILITY (OBS-02): Log Analytics workspace '${LOG_ANALYTICS_WORKSPACE_NAME}'"
+echo "  and Application Insights '${APP_INSIGHTS_NAME}' were just deployed automatically —"
+echo "  no manual portal step needed for these two. config.yaml's"
+echo "  infra.app_insights_connection_string was populated above and update_agent.py"
+echo "  wires it into both agents as APPLICATIONINSIGHTS_CONNECTION_STRING. A best-effort"
+echo "  Azure Monitor Workbook was also deployed to this resource group — open it from"
+echo "  the resource group's Workbooks blade, or Application Insights '${APP_INSIGHTS_NAME}' >"
+echo "  Workbooks. If it doesn't render correctly, infra/observability/queries.kql has"
+echo "  the same queries to paste into a manually created Workbook or the Logs blade —"
+echo "  see DEPLOYMENT_AAF.md section 3.6 for the full writeup, including the free"
+echo "  optional step of enabling diagnostic settings on the Foundry model deployment"
+echo "  itself for platform-level token/request metrics at zero extra code."
 echo ""
 echo "================================================================"

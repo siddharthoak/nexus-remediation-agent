@@ -4,3 +4,8 @@ GitPython>=3.1.41
 PyGithub>=2.1.1
 azure-cosmos>=4.7.0
 azure-identity>=1.15.0
+
+# OBS-02: Azure Monitor telemetry (common/telemetry.py) — deployed (azure) mode only;
+# common/telemetry.py no-ops if APPLICATIONINSIGHTS_CONNECTION_STRING is unset, so this
+# import is never reached during local Docker/Podman testing.
+azure-monitor-opentelemetry>=1.6.0

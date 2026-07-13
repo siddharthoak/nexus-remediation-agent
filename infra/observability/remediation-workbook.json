@@ -1,0 +1,108 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# OSS Vulnerability Remediation — AI Usage & Fix History\n\nRun history, retry lineage, and Claude token spend for the Fixer/Watcher pipeline. Data source: the `traces` table (Application Insights), populated by `agents/common/telemetry.py`. Deployed (`DEPLOYMENT_MODE=azure`) only — see PLAN.md section 4.9 and DEPLOYMENT_AAF.md section 3.6. If a panel below renders empty, widen the time range control (top right) — it defaults to the last 30 days."
+      },
+      "name": "text - title"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where message == \"FixAttemptCompleted\"\n| extend repo = tostring(customDimensions.repo),\n         component = tostring(customDimensions.component_name),\n         old_version = tostring(customDimensions.old_version),\n         new_version = tostring(customDimensions.new_version),\n         mode = tostring(customDimensions.mode),\n         cve_ids = tostring(customDimensions.cve_ids),\n         framework = tostring(customDimensions.framework_detected),\n         unit_test_status = tostring(customDimensions.unit_test_status),\n         prompt_tokens = toint(customDimensions.prompt_tokens),\n         completion_tokens = toint(customDimensions.completion_tokens),\n         total_tokens = toint(customDimensions.total_tokens),\n         attempt_number = toint(customDimensions.attempt_number)\n| project timestamp, repo, component, old_version, new_version, mode, attempt_number, cve_ids, framework, unit_test_status, prompt_tokens, completion_tokens, total_tokens\n| order by timestamp desc",
+        "size": 0,
+        "timeContext": { "durationMs": 2592000000 },
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "table",
+        "gridSettings": { "formatters": [] }
+      },
+      "name": "query - fix attempts (run history)"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where message in (\"FixResolved\", \"FixEscalated\", \"FixRetryRequested\")\n| extend repo = tostring(customDimensions.repo),\n         component = tostring(customDimensions.component_name),\n         pr_number = tostring(customDimensions.pr_number),\n         attempt_number = toint(customDimensions.attempt_number),\n         reason = tostring(customDimensions.reason),\n         resolution_hours = round(todouble(customDimensions.time_to_resolution_seconds) / 3600, 2),\n         outcome = message\n| project timestamp, outcome, repo, component, pr_number, attempt_number, reason, resolution_hours\n| order by timestamp desc",
+        "size": 0,
+        "timeContext": { "durationMs": 2592000000 },
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "table",
+        "gridSettings": { "formatters": [] }
+      },
+      "name": "query - retry lineage / resolutions / escalations"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Token Usage & Spend\n\nToken usage per CVE/component fix, and aggregated over time — this is what the model calls actually cost, independent of Azure AI Foundry's own platform-level token metrics (Section 3.6 of DEPLOYMENT_AAF.md covers enabling those too, for a second, code-free cross-check)."
+      },
+      "name": "text - token usage header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where message == \"FixAttemptCompleted\"\n| extend component = tostring(customDimensions.component_name), total_tokens = toint(customDimensions.total_tokens)\n| summarize TotalTokens = sum(total_tokens), FixAttempts = count() by component\n| order by TotalTokens desc\n| take 20",
+        "size": 0,
+        "timeContext": { "durationMs": 2592000000 },
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "barchart"
+      },
+      "name": "query - tokens by CVE/component"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where message == \"FixAttemptCompleted\"\n| extend total_tokens = toint(customDimensions.total_tokens)\n| summarize TotalTokens = sum(total_tokens), FixAttempts = count() by bin(timestamp, 1d)\n| order by timestamp asc",
+        "size": 0,
+        "timeContext": { "durationMs": 2592000000 },
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "timechart"
+      },
+      "name": "query - tokens over time"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where message == \"FixAttemptCompleted\"\n| extend total_tokens = toint(customDimensions.total_tokens), mode = tostring(customDimensions.mode)\n| summarize FixAttempts = count(), TotalTokens = sum(total_tokens), AvgTokensPerAttempt = round(avg(total_tokens), 0) by mode\n| order by mode asc",
+        "size": 0,
+        "timeContext": { "durationMs": 2592000000 },
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "table"
+      },
+      "name": "query - fresh vs retry token cost"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Resolution Rate\n\nCounts of confirmed-fixed vs. escalated-to-human outcomes over time — the 'gains' side of the ROI picture (PLAN.md's Complex Upgrades vs. ROI section)."
+      },
+      "name": "text - resolution rate header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where message in (\"FixResolved\", \"FixEscalated\")\n| summarize Count = count() by bin(timestamp, 1d), Outcome = message\n| order by timestamp asc",
+        "size": 0,
+        "timeContext": { "durationMs": 2592000000 },
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "timechart"
+      },
+      "name": "query - resolved vs escalated over time"
+    }
+  ],
+  "isLocked": false,
+  "fallbackResourceIds": [ "__APPINSIGHTS_RESOURCE_ID__" ]
+}

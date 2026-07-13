@@ -43,6 +43,9 @@ class TrackingStatus(str, Enum):
     RETRY_REQUESTED      = "RETRY_REQUESTED"   # Set by Watcher; only Fixer may act on this
     FAILED_MAX_RETRIES   = "FAILED_MAX_RETRIES"
     ESCALATED            = "ESCALATED"
+    SKIPPED              = "SKIPPED"           # Set by Classifier for Bucket 1/4 — terminal, Issue created
+    IGNORED              = "IGNORED"           # [DEFERRED] Discovery: matched ignore_list.yaml
+    KNOWN_BLOCKED        = "KNOWN_BLOCKED"     # [DEFERRED] Discovery: matched known_list.yaml
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -75,6 +78,9 @@ class TrackingRecord:
     failure_log_excerpt: Optional[str] = None  # Written by Watcher; read by Fixer on retry
     framework_detected: Optional[str] = None  # e.g. "maven", "gradle", "npm", "python"; set by Fixer at startup
     unit_test_status: Optional[str] = None   # "SUCCESS" | "NO_TESTS_FOUND" | "SOFT_FAIL"; set at end_turn
+    bucket: Optional[int] = None             # 1-4; set by Classifier after KB hydration
+    skip_reason: Optional[str] = None        # Set by Classifier (Bucket 1/4); included in GitHub Issue body
+    kb_hit: Optional[bool] = None            # True if the Fixer applied stored KB patterns with no model call
 
 
 # ── Protocol ──────────────────────────────────────────────────────────────────

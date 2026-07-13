@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from common.tracking_store import TrackingStatus, make_retry_record
+from common.telemetry import emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,16 @@ class RetryGate:
                 "PR #%d: Fixer invoked with tracking_id=%s.",
                 pr_number, retry_record.tracking_id[:8],
             )
+            emit_event(
+                "FixRetryRequested",
+                tracking_id=retry_record.tracking_id,
+                parent_tracking_id=retry_record.parent_tracking_id,
+                repo=retry_record.repo,
+                component_name=retry_record.component_name,
+                pr_number=pr_number,
+                attempt_number=retry_record.attempt_number,
+                max_retry_attempts=self._max_attempts,
+            )
         except Exception as exc:
             # If we can't invoke the Fixer, mark the record as failed so the
             # Watcher doesn't create another RETRY_REQUESTED on the next poll cycle.
@@ -127,6 +138,15 @@ class RetryGate:
             )
             retry_record.status = TrackingStatus.ESCALATED.value
             self._store.update(retry_record)
+            emit_event(
+                "FixEscalated",
+                tracking_id=retry_record.tracking_id,
+                repo=retry_record.repo,
+                component_name=retry_record.component_name,
+                pr_number=pr_number,
+                attempt_number=retry_record.attempt_number,
+                reason="fixer_invocation_failed",
+            )
             self._post_escalation_comment(
                 pr_number,
                 f"The Watcher agent could not invoke the Fixer for retry "
@@ -153,6 +173,19 @@ class RetryGate:
         record.status = TrackingStatus.FAILED_MAX_RETRIES.value
         record.time_to_resolution_seconds = resolution_seconds
         self._store.update(record)
+        emit_event(
+            "FixEscalated",
+            tracking_id=record.tracking_id,
+            repo=record.repo,
+            component_name=record.component_name,
+            old_version=record.old_version,
+            new_version=record.new_version,
+            pr_number=pr_number,
+            attempt_number=record.attempt_number,
+            max_retry_attempts=self._max_attempts,
+            time_to_resolution_seconds=resolution_seconds,
+            reason="max_retries_reached",
+        )
 
         self._post_escalation_comment(
             pr_number,
